@@ -7,7 +7,7 @@ pub struct Metadata {
     pub status: Option<crate::Status>,
     pub checkbox: Option<bool>,
     pub date: Option<String>,
-    pub order: Option<u32>,
+    pub order: Option<crate::OrderMetadata>,
     pub assignee: Option<String>,
     pub wbs: Vec<String>,
 }
@@ -186,24 +186,24 @@ pub fn extract_metadata(line: &str) -> Metadata {
     let mut md = Metadata::default();
     let without_bullet = strip_markdown_bullet(line.trim_start());
 
-    if let Some(rest) = without_bullet.strip_prefix("[ ]") {
-        md.checkbox = Some(false);
-        md.status = Some(crate::Status::Todo);
-        let _ = rest;
-    } else if let Some(rest) = without_bullet
-        .strip_prefix("[x]")
-        .or_else(|| without_bullet.strip_prefix("[X]"))
-    {
-        md.checkbox = Some(true);
-        md.status = Some(crate::Status::Done);
-        let _ = rest;
+    if let Some(status) = checkbox_status(without_bullet) {
+        md.checkbox = Some(matches!(status, crate::Status::Done));
+        md.status = Some(status);
     }
 
     for word in line.split(|ch: char| !is_metadata_word_char(ch)) {
         match word {
             "TODO" => md.status = Some(crate::Status::Todo),
+            "GO" => md.status = Some(crate::Status::Go),
             "DONE" => md.status = Some(crate::Status::Done),
+            "QUESTION" => md.status = Some(crate::Status::Question),
+            "INFO" => md.status = Some(crate::Status::Info),
             "WIP" => md.status = Some(crate::Status::Wip),
+            "BLOCKED" => md.status = Some(crate::Status::Blocked),
+            "FORWARD" => md.status = Some(crate::Status::Forward),
+            "PLANNED" => md.status = Some(crate::Status::Planned),
+            "CANCELED" | "CANCELLED" => md.status = Some(crate::Status::Canceled),
+            "ASSIGNED" => md.status = Some(crate::Status::Assigned),
             _ if word.starts_with("&&") && word.len() > 2 => md.definitions.push(word.to_string()),
             _ if word.starts_with('&') && word.len() > 1 => parse_amp_metadata(word, &mut md),
             _ => {}
@@ -211,6 +211,27 @@ pub fn extract_metadata(line: &str) -> Metadata {
     }
 
     md
+}
+
+fn checkbox_status(line: &str) -> Option<crate::Status> {
+    let marker = line.strip_prefix('[')?.chars().next()?;
+    if !line.get(2..)?.starts_with(']') {
+        return None;
+    }
+    match marker {
+        ' ' => Some(crate::Status::Todo),
+        '*' => Some(crate::Status::Go),
+        '/' => Some(crate::Status::Wip),
+        'x' | 'X' => Some(crate::Status::Done),
+        '?' => Some(crate::Status::Question),
+        'i' | 'I' => Some(crate::Status::Info),
+        '!' => Some(crate::Status::Blocked),
+        '>' => Some(crate::Status::Forward),
+        '<' => Some(crate::Status::Planned),
+        '-' => Some(crate::Status::Canceled),
+        '~' => Some(crate::Status::Assigned),
+        _ => None,
+    }
 }
 
 pub fn strip_amp_metadata(text: &str) -> String {
@@ -321,6 +342,7 @@ fn is_amp_start(ch: char) -> bool {
     ch == '&'
         || ch == ':'
         || ch == '#'
+        || ch == '^'
         || ch == '@'
         || ch == '?'
         || ch.is_ascii_alphanumeric()
@@ -333,6 +355,7 @@ fn is_metadata_word_char(ch: char) -> bool {
         || ch == '&'
         || ch == ':'
         || ch == '#'
+        || ch == '^'
         || ch == '@'
         || ch == '?'
 }
@@ -342,10 +365,21 @@ fn parse_amp_metadata(word: &str, md: &mut Metadata) {
     if value.len() == 8 && value.chars().all(|ch| ch.is_ascii_digit()) {
         md.date = Some(value.to_string());
     } else if let Some(order) = value
-        .strip_prefix('#')
+        .strip_prefix("#")
         .and_then(|raw| raw.parse::<u32>().ok())
     {
-        md.order = Some(order);
+        md.order = Some(crate::OrderMetadata {
+            value: order,
+            exclusive: false,
+        });
+    } else if let Some(order) = value
+        .strip_prefix("^#")
+        .and_then(|raw| raw.parse::<u32>().ok())
+    {
+        md.order = Some(crate::OrderMetadata {
+            value: order,
+            exclusive: true,
+        });
     } else if let Some(assignee) = value.strip_prefix('@') {
         if !assignee.is_empty() {
             md.assignee = Some(assignee.to_string());
@@ -390,8 +424,26 @@ mod tests {
         assert_eq!(md.status, Some(crate::Status::Todo));
         assert_eq!(md.references, vec!["&proj:scan"]);
         assert_eq!(md.date.as_deref(), Some("20260805"));
-        assert_eq!(md.order, Some(12));
+        assert_eq!(
+            md.order,
+            Some(crate::OrderMetadata {
+                value: 12,
+                exclusive: false
+            })
+        );
         assert_eq!(md.assignee.as_deref(), Some("geert"));
+    }
+
+    #[test]
+    fn extracts_exclusive_order_metadata() {
+        let md = extract_metadata("- [ ] TODO &^#12");
+        assert_eq!(
+            md.order,
+            Some(crate::OrderMetadata {
+                value: 12,
+                exclusive: true
+            })
+        );
     }
 
     #[test]
@@ -406,6 +458,35 @@ mod tests {
         let md = extract_metadata("- [ ] &proj:scan");
         assert_eq!(md.checkbox, Some(false));
         assert_eq!(md.status, Some(crate::Status::Todo));
+    }
+
+    #[test]
+    fn canceled_checkbox_implies_canceled() {
+        let md = extract_metadata("- [-] &proj:scan");
+        assert_eq!(md.checkbox, Some(false));
+        assert_eq!(md.status, Some(crate::Status::Canceled));
+    }
+
+    #[test]
+    fn extracts_all_checkbox_statuses() {
+        let cases = [
+            ("[ ]", crate::Status::Todo),
+            ("[*]", crate::Status::Go),
+            ("[/]", crate::Status::Wip),
+            ("[x]", crate::Status::Done),
+            ("[?]", crate::Status::Question),
+            ("[i]", crate::Status::Info),
+            ("[!]", crate::Status::Blocked),
+            ("[>]", crate::Status::Forward),
+            ("[<]", crate::Status::Planned),
+            ("[-]", crate::Status::Canceled),
+            ("[~]", crate::Status::Assigned),
+        ];
+
+        for (marker, status) in cases {
+            let md = extract_metadata(&format!("- {marker} &task"));
+            assert_eq!(md.status, Some(status));
+        }
     }
 
     #[test]

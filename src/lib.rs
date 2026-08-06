@@ -1,3 +1,4 @@
+pub mod naft;
 mod parse;
 mod scan;
 
@@ -63,8 +64,22 @@ pub struct SourceFile {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Status {
     Todo,
+    Go,
     Done,
+    Question,
+    Info,
     Wip,
+    Blocked,
+    Forward,
+    Planned,
+    Canceled,
+    Assigned,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OrderMetadata {
+    pub value: u32,
+    pub exclusive: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -75,7 +90,7 @@ pub struct Definition {
     pub file: Option<FileId>,
     pub line: Option<usize>,
     pub date: Option<String>,
-    pub order: Option<u32>,
+    pub order: Option<OrderMetadata>,
     pub assignee: Option<String>,
     pub wbs: Vec<String>,
 }
@@ -88,7 +103,7 @@ pub struct Chore {
     pub text: String,
     pub status: Option<Status>,
     pub date: Option<String>,
-    pub order: Option<u32>,
+    pub order: Option<OrderMetadata>,
     pub assignee: Option<String>,
     pub wbs: Vec<String>,
     pub definitions: Vec<DefinitionId>,
@@ -117,6 +132,18 @@ pub enum CheckIssueKind {
     RelativeDefinitionWithoutParent,
     WbsWithoutDefinition,
     MarkdownParsing,
+    ConflictingExclusiveOrder,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ComputedOrder {
+    pub value: u32,
+    pub exclusive: bool,
+    pub conflict: bool,
+}
+
+pub fn computed_chore_order(forest: &Forest, chore: &Chore) -> Option<ComputedOrder> {
+    computed_chore_order_for_definitions(&forest.definitions, chore)
 }
 
 #[derive(Debug, Clone)]
@@ -580,8 +607,9 @@ impl ForestBuilder {
                     line.line,
                 );
             }
+            add_existing_ancestor_definitions(&self, &mut ids, &mut seen);
 
-            chores.push(Chore {
+            let chore = Chore {
                 file: line.file,
                 line: line.line,
                 column: line.column,
@@ -592,7 +620,18 @@ impl ForestBuilder {
                 assignee: line.metadata.assignee,
                 wbs: line.metadata.wbs,
                 definitions: ids,
-            });
+            };
+            if computed_chore_order_for_definitions(&self.definitions, &chore)
+                .is_some_and(|order| order.conflict)
+            {
+                self.issues.push(CheckIssue {
+                    kind: CheckIssueKind::ConflictingExclusiveOrder,
+                    file: Some(chore.file),
+                    line: Some(chore.line),
+                    message: "Chore has multiple related exclusive order values".to_string(),
+                });
+            }
+            chores.push(chore);
         }
 
         Forest {
@@ -656,6 +695,70 @@ impl ForestBuilder {
             }
         }
     }
+}
+
+fn add_existing_ancestor_definitions(
+    builder: &ForestBuilder,
+    ids: &mut Vec<DefinitionId>,
+    seen: &mut HashSet<DefinitionId>,
+) {
+    let paths = ids
+        .iter()
+        .map(|id| builder.definitions[id.0].path.clone())
+        .collect::<Vec<_>>();
+    for path in paths {
+        let mut current = path.as_str();
+        while let Some((parent, _)) = current.rsplit_once(':') {
+            if parent.is_empty() {
+                break;
+            }
+            if let Some(id) = builder.definition_by_path.get(parent).copied() {
+                if seen.insert(id) {
+                    ids.push(id);
+                }
+            }
+            current = parent;
+        }
+    }
+}
+
+fn computed_chore_order_for_definitions(
+    definitions: &[Definition],
+    chore: &Chore,
+) -> Option<ComputedOrder> {
+    let orders = chore
+        .definitions
+        .iter()
+        .filter_map(|id| definitions[id.0].order)
+        .collect::<Vec<_>>();
+    let exclusive = orders
+        .iter()
+        .filter(|order| order.exclusive)
+        .copied()
+        .collect::<Vec<_>>();
+    if !exclusive.is_empty() {
+        let value = exclusive.iter().map(|order| order.value).min()?;
+        let mut unique = exclusive
+            .iter()
+            .map(|order| order.value)
+            .collect::<Vec<_>>();
+        unique.sort_unstable();
+        unique.dedup();
+        return Some(ComputedOrder {
+            value,
+            exclusive: true,
+            conflict: unique.len() > 1,
+        });
+    }
+    orders
+        .iter()
+        .map(|order| order.value)
+        .min()
+        .map(|value| ComputedOrder {
+            value,
+            exclusive: false,
+            conflict: false,
+        })
 }
 
 fn push_resolved_amp(
@@ -835,6 +938,62 @@ mod tests {
                 .iter()
                 .any(|issue| issue.kind == CheckIssueKind::WbsWithoutDefinition)
         );
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn chore_references_existing_ancestor_definitions() {
+        let dir = test_dir("ancestors");
+        fs::write(
+            dir.join("notes.md"),
+            "# Root &&:a &#9\n## Middle &&:a:b &#4\n- [ ] TODO &a:b:c leaf\n",
+        )
+        .unwrap();
+
+        let forest = build_forest(&Config::from_roots(vec![dir.clone()])).unwrap();
+        let chore = forest
+            .chores
+            .iter()
+            .find(|chore| chore.text.contains("leaf"))
+            .unwrap();
+        let paths = chore
+            .definitions
+            .iter()
+            .map(|id| forest.definitions[id.0].path.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(paths.contains(&"a"));
+        assert!(paths.contains(&"a:b"));
+        assert!(paths.contains(&"a:b:c"));
+        assert_eq!(computed_chore_order(&forest, chore).unwrap().value, 4);
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn conflicting_exclusive_orders_are_reported() {
+        let dir = test_dir("exclusive-conflict");
+        fs::write(
+            dir.join("notes.md"),
+            "# Root &&:a &^#9\n## Middle &&:a:b &^#4\n- [ ] TODO &a:b:c leaf\n",
+        )
+        .unwrap();
+
+        let forest = build_forest(&Config::from_roots(vec![dir.clone()])).unwrap();
+        let chore = forest
+            .chores
+            .iter()
+            .find(|chore| chore.text.contains("leaf"))
+            .unwrap();
+        let order = computed_chore_order(&forest, chore).unwrap();
+
+        assert_eq!(order.value, 4);
+        assert!(order.exclusive);
+        assert!(order.conflict);
+        assert!(forest.issues.iter().any(|issue| {
+            issue.kind == CheckIssueKind::ConflictingExclusiveOrder && issue.line == Some(3)
+        }));
 
         fs::remove_dir_all(dir).unwrap();
     }

@@ -1,16 +1,30 @@
-use std::collections::BTreeMap;
+use std::fs;
 use std::path::{Path, PathBuf};
 
 use chimp::{
-    CheckIssue, Chore, Config, ExportOptions, Forest, GroveConfig, Status, build_forest,
-    export_forest,
+    CheckIssue, Chore, ComputedOrder, Config, ExportOptions, Forest, GroveConfig, OrderMetadata,
+    Status, build_forest, computed_chore_order, export_forest,
 };
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
-    let Some(command) = args.next() else {
+    let mut color = true;
+    let mut verbose = 1u8;
+    let mut command = None;
+    while let Some(arg) = args.next() {
+        if arg == "--nocolor" {
+            color = false;
+        } else if arg == "-V" || arg == "--verbose" {
+            let value = args.next().ok_or("-V requires a level")?;
+            verbose = parse_verbose_level(&value)?;
+        } else {
+            command = Some(arg);
+            break;
+        }
+    }
+    let Some(command) = command else {
         print_help();
         return Ok(());
     };
@@ -31,6 +45,8 @@ fn main() -> Result<()> {
             let mut status_filter = None;
             let mut assignee_filters = Vec::new();
             let mut query_terms = Vec::new();
+            let mut details = false;
+            let mut limit = None;
 
             while let Some(arg) = args.next() {
                 match arg.as_str() {
@@ -44,6 +60,11 @@ fn main() -> Result<()> {
                     "-a" | "--assignee" => {
                         assignee_filters.push(args.next().ok_or("--assignee requires a value")?);
                     }
+                    "-d" | "--details" => details = true,
+                    "-n" | "--limit" => {
+                        let value = args.next().ok_or("-n requires a count")?;
+                        limit = Some(parse_count(&value)?);
+                    }
                     _ if arg.starts_with('-') => {
                         return Err(format!("unexpected argument: {arg}").into());
                     }
@@ -54,15 +75,17 @@ fn main() -> Result<()> {
                 }
             }
 
-            let forest = build_forest(&Config::from_groves(default_groves_with_extra(
-                extra_roots,
-            )?))?;
+            let cli_config = default_cli_config_with_extra(extra_roots)?;
+            let forest = build_forest(&Config::from_groves(cli_config.groves.clone()))?;
             print_chore_search_results(
                 &forest,
                 status_filter,
                 &assignee_filters,
                 &query_terms,
-                true,
+                color,
+                details,
+                limit,
+                cli_config.default_assignee.as_deref(),
             );
         }
         "wbs" => {
@@ -81,7 +104,7 @@ fn main() -> Result<()> {
             let forest = build_forest(&Config::from_groves(default_groves_with_extra(
                 extra_roots,
             )?))?;
-            print_wbs_results(&forest, true);
+            print_wbs_results(&forest, color);
         }
         "groves" => {
             let mut extra_roots = Vec::new();
@@ -115,6 +138,24 @@ fn main() -> Result<()> {
                 extra_roots,
             )?))?;
             print_check_issues(&forest);
+        }
+        "debug" => {
+            let mut extra_roots = Vec::new();
+            while let Some(arg) = args.next() {
+                match arg.as_str() {
+                    "-C" | "--grove" => {
+                        extra_roots.push(PathBuf::from(args.next().ok_or("-C requires a path")?));
+                    }
+                    _ if arg.starts_with('-') => {
+                        return Err(format!("unexpected argument: {arg}").into());
+                    }
+                    _ => extra_roots.push(PathBuf::from(arg)),
+                }
+            }
+            let forest = build_forest(&Config::from_groves(default_groves_with_extra(
+                extra_roots,
+            )?))?;
+            print_debug(&forest, color);
         }
         "export" => {
             let mut destination = None;
@@ -160,6 +201,53 @@ fn main() -> Result<()> {
             let summary = export_forest(&forest, destination, &options)?;
             println!("files_written={}", summary.files_written);
         }
+        "naft" => {
+            let Some(subcommand) = args.next() else {
+                return Err("naft requires encode or decode".into());
+            };
+            match subcommand.as_str() {
+                "encode" => {
+                    let out = PathBuf::from(args.next().ok_or("naft encode requires OUT.naft")?);
+                    let mut folders = Vec::new();
+                    let mut include_hidden = false;
+                    let mut include_ignored = false;
+                    for arg in args {
+                        match arg.as_str() {
+                            "-u" => include_hidden = true,
+                            "-U" => include_ignored = true,
+                            _ if arg.starts_with('-') => {
+                                return Err(format!("unexpected argument: {arg}").into());
+                            }
+                            _ => folders.push(PathBuf::from(arg)),
+                        }
+                    }
+                    if folders.is_empty() {
+                        return Err("naft encode requires at least one folder".into());
+                    }
+                    let nodes = chimp::naft::encode_folders_with_options(
+                        &folders,
+                        &chimp::naft::EncodeOptions {
+                            verbose,
+                            include_hidden,
+                            include_ignored,
+                        },
+                        |path| eprintln!("processing {}", path.display()),
+                    )?;
+                    fs::write(out, chimp::naft::serialize_document(&nodes))?;
+                }
+                "decode" => {
+                    let input = args.next().ok_or("naft decode requires IN.naft")?;
+                    let base = args.next().ok_or("naft decode requires BASE_FOLDER")?;
+                    if args.next().is_some() {
+                        return Err("unexpected argument after naft decode BASE_FOLDER".into());
+                    }
+                    let text = fs::read_to_string(input)?;
+                    let nodes = chimp::naft::parse_document(&text)?;
+                    chimp::naft::decode_to_base(&nodes, base)?;
+                }
+                _ => return Err(format!("unknown naft command: {subcommand}").into()),
+            }
+        }
         "help" | "--help" | "-h" => print_help(),
         _ => return Err(format!("unknown command: {command}").into()),
     }
@@ -189,35 +277,62 @@ fn default_groves(roots: Vec<PathBuf>) -> Result<Vec<GroveConfig>> {
 }
 
 fn default_groves_with_extra(extra_roots: Vec<PathBuf>) -> Result<Vec<GroveConfig>> {
-    let mut groves = read_config_groves_from_default_locations()?.unwrap_or_default();
-    groves.extend(extra_roots.into_iter().map(GroveConfig::from_root));
-    if groves.is_empty() {
-        groves.push(GroveConfig::from_root(std::env::current_dir()?));
-    }
-    Ok(groves)
+    Ok(default_cli_config_with_extra(extra_roots)?.groves)
 }
 
 fn read_config_groves_from_default_locations() -> Result<Option<Vec<GroveConfig>>> {
-    let mut groves = Vec::new();
+    Ok(read_cli_config_from_default_locations()?.map(|config| config.groves))
+}
+
+#[derive(Debug, Clone, Default)]
+struct CliConfig {
+    groves: Vec<GroveConfig>,
+    default_assignee: Option<String>,
+}
+
+fn default_cli_config_with_extra(extra_roots: Vec<PathBuf>) -> Result<CliConfig> {
+    let mut config = read_cli_config_from_default_locations()?.unwrap_or_default();
+    config
+        .groves
+        .extend(extra_roots.into_iter().map(GroveConfig::from_root));
+    if config.groves.is_empty() {
+        config
+            .groves
+            .push(GroveConfig::from_root(std::env::current_dir()?));
+    }
+    Ok(config)
+}
+
+fn read_cli_config_from_default_locations() -> Result<Option<CliConfig>> {
+    let mut config = CliConfig::default();
     if let Some(home) = std::env::var_os("HOME") {
         let path = PathBuf::from(home).join(".config/chimp/config.toml");
-        groves.extend(read_config_groves(&path)?);
+        config.merge(read_cli_config(&path)?);
     }
-    groves.extend(read_config_groves(Path::new("chimp.toml"))?);
-    if groves.is_empty() {
+    config.merge(read_cli_config(Path::new("chimp.toml"))?);
+    if config.groves.is_empty() && config.default_assignee.is_none() {
         Ok(None)
     } else {
-        Ok(Some(groves))
+        Ok(Some(config))
     }
 }
 
-fn read_config_groves(path: &Path) -> Result<Vec<GroveConfig>> {
+impl CliConfig {
+    fn merge(&mut self, other: CliConfig) {
+        self.groves.extend(other.groves);
+        if other.default_assignee.is_some() {
+            self.default_assignee = other.default_assignee;
+        }
+    }
+}
+
+fn read_cli_config(path: &Path) -> Result<CliConfig> {
     if !path.exists() {
-        return Ok(Vec::new());
+        return Ok(CliConfig::default());
     }
     let base = path.parent().unwrap_or_else(|| Path::new("."));
     let text = std::fs::read_to_string(path)?;
-    Ok(parse_config_groves(base, &text))
+    Ok(parse_config(base, &text))
 }
 
 fn config_root_path(base: &Path, root: PathBuf) -> PathBuf {
@@ -245,8 +360,8 @@ impl GroveDraft {
     }
 }
 
-fn parse_config_groves(base: &Path, text: &str) -> Vec<GroveConfig> {
-    let mut groves = Vec::new();
+fn parse_config(base: &Path, text: &str) -> CliConfig {
+    let mut config = CliConfig::default();
     let mut current = None::<GroveDraft>;
 
     for line in text.lines().map(str::trim) {
@@ -255,7 +370,7 @@ fn parse_config_groves(base: &Path, text: &str) -> Vec<GroveConfig> {
         }
         if line == "[[grove]]" || line == "[[groves]]" {
             if let Some(draft) = current.take().and_then(|draft| draft.finish(base)) {
-                groves.push(draft);
+                config.groves.push(draft);
             }
             current = Some(GroveDraft::default());
             continue;
@@ -264,7 +379,10 @@ fn parse_config_groves(base: &Path, text: &str) -> Vec<GroveConfig> {
         if let Some(draft) = current.as_mut() {
             apply_grove_config_line(draft, line);
         } else {
-            groves.extend(
+            if let Some(value) = config_value(line, "default_assignee") {
+                config.default_assignee = quoted_value(value).map(str::to_string);
+            }
+            config.groves.extend(
                 parse_root_config_line(line)
                     .into_iter()
                     .map(|root| GroveConfig::from_root(config_root_path(base, root))),
@@ -273,10 +391,10 @@ fn parse_config_groves(base: &Path, text: &str) -> Vec<GroveConfig> {
     }
 
     if let Some(draft) = current.and_then(|draft| draft.finish(base)) {
-        groves.push(draft);
+        config.groves.push(draft);
     }
 
-    groves
+    config
 }
 
 fn apply_grove_config_line(draft: &mut GroveDraft, line: &str) {
@@ -352,12 +470,32 @@ fn quoted_value(value: &str) -> Option<&str> {
 }
 
 fn parse_status(value: &str) -> Result<Status> {
-    match value {
-        "TODO" | "todo" => Ok(Status::Todo),
-        "DONE" | "done" => Ok(Status::Done),
-        "WIP" | "wip" => Ok(Status::Wip),
-        _ => Err("status must be TODO, DONE, or WIP".into()),
+    match value.to_ascii_uppercase().as_str() {
+        "TODO" => Ok(Status::Todo),
+        "GO" => Ok(Status::Go),
+        "WIP" => Ok(Status::Wip),
+        "DONE" => Ok(Status::Done),
+        "QUESTION" => Ok(Status::Question),
+        "INFO" => Ok(Status::Info),
+        "BLOCKED" => Ok(Status::Blocked),
+        "FORWARD" => Ok(Status::Forward),
+        "PLANNED" => Ok(Status::Planned),
+        "CANCELED" | "CANCELLED" => Ok(Status::Canceled),
+        "ASSIGNED" => Ok(Status::Assigned),
+        _ => Err("status must be TODO, GO, WIP, DONE, QUESTION, INFO, BLOCKED, FORWARD, PLANNED, CANCELED, or ASSIGNED".into()),
     }
+}
+
+fn parse_count(value: &str) -> Result<usize> {
+    let count = value.parse::<usize>()?;
+    if count == 0 {
+        return Err("count must be greater than zero".into());
+    }
+    Ok(count)
+}
+
+fn parse_verbose_level(value: &str) -> Result<u8> {
+    Ok(value.parse::<u8>()?)
 }
 
 fn print_groves(groves: &[GroveConfig]) {
@@ -410,22 +548,104 @@ fn format_check_issue(forest: &Forest, issue: &CheckIssue) -> String {
     format!("{location}: {:?}: {}", issue.kind, issue.message)
 }
 
+fn print_debug(forest: &Forest, color: bool) {
+    println!(
+        "files={} definitions={} chores={} issues={}",
+        forest.files.len(),
+        forest.definitions.len(),
+        forest.chores.len(),
+        forest.issues.len()
+    );
+    println!("files");
+    for file in &forest.files {
+        println!(
+            "  {}: grove={} path={} bytes={}",
+            file.id.0,
+            file.grove,
+            file.path.display(),
+            file.bytes.len()
+        );
+    }
+    println!("definitions");
+    for definition in &forest.definitions {
+        println!(
+            "  {}: path={} phony={} location={} order={} assignee={} wbs={}",
+            definition.id.0,
+            definition.path,
+            definition.is_phony,
+            definition_location(forest, definition.file, definition.line),
+            metadata_order_label(definition.order),
+            option_str(definition.assignee.as_deref()),
+            list_or_dash(&definition.wbs)
+        );
+    }
+    println!("chores");
+    for chore in &forest.chores {
+        let defs = chore
+            .definitions
+            .iter()
+            .map(|id| forest.definitions[id.0].path.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let order = chore_order(forest, chore);
+        println!(
+            "  {}",
+            colorize(
+                &format!(
+                    "{}:{}:{} order={} status={} assignee={} date={} wbs={} defs=[{}] text={}",
+                    forest.files[chore.file.0].path.display(),
+                    chore.line,
+                    chore.column,
+                    order_label(order),
+                    status_label(chore.status),
+                    option_str(chore.assignee.as_deref()),
+                    option_str(chore.date.as_deref()),
+                    list_or_dash(&chore.wbs),
+                    defs,
+                    chore.text.trim()
+                ),
+                order,
+                color
+            )
+        );
+    }
+    println!("issues");
+    for issue in &forest.issues {
+        println!("  {}", format_check_issue(forest, issue));
+    }
+}
+
+fn definition_location(
+    forest: &Forest,
+    file: Option<chimp::FileId>,
+    line: Option<usize>,
+) -> String {
+    match (file, line) {
+        (Some(file), Some(line)) => format!("{}:{line}", forest.files[file.0].path.display()),
+        (Some(file), None) => forest.files[file.0].path.display().to_string(),
+        _ => "-".to_string(),
+    }
+}
+
 fn chore_matches(
     forest: &Forest,
     chore: &Chore,
     status_filter: Option<Status>,
     assignee_filters: &[String],
     query_terms: &[String],
+    default_assignee: Option<&str>,
 ) -> bool {
+    if !chore.status.is_some_and(chore_status_is_reported) {
+        return false;
+    }
     if status_filter.is_some_and(|status| chore.status != Some(status)) {
         return false;
     }
     if !assignee_filters.is_empty()
         && !assignee_filters.iter().any(|assignee| {
-            chore.assignee.as_deref() == Some(assignee.as_str())
-                || chore.definitions.iter().any(|id| {
-                    forest.definitions[id.0].assignee.as_deref() == Some(assignee.as_str())
-                })
+            effective_chore_assignees(forest, chore, default_assignee)
+                .iter()
+                .any(|candidate| *candidate == assignee.as_str())
         })
     {
         return false;
@@ -433,6 +653,37 @@ fn chore_matches(
     query_terms
         .iter()
         .all(|term| searchable_text_contains(forest, chore, term))
+}
+
+fn chore_status_is_reported(status: Status) -> bool {
+    matches!(
+        status,
+        Status::Todo | Status::Go | Status::Wip | Status::Question | Status::Blocked
+    )
+}
+
+fn effective_chore_assignees<'a>(
+    forest: &'a Forest,
+    chore: &'a Chore,
+    default_assignee: Option<&'a str>,
+) -> Vec<&'a str> {
+    let mut assignees = Vec::new();
+    if let Some(assignee) = chore.assignee.as_deref() {
+        assignees.push(assignee);
+    }
+    for id in &chore.definitions {
+        if let Some(assignee) = forest.definitions[id.0].assignee.as_deref() {
+            if !assignees.contains(&assignee) {
+                assignees.push(assignee);
+            }
+        }
+    }
+    if assignees.is_empty() {
+        if let Some(assignee) = default_assignee {
+            assignees.push(assignee);
+        }
+    }
+    assignees
 }
 
 fn searchable_text_contains(forest: &Forest, chore: &Chore, term: &str) -> bool {
@@ -459,12 +710,8 @@ fn searchable_text_contains(forest: &Forest, chore: &Chore, term: &str) -> bool 
     })
 }
 
-fn max_definition_order(forest: &Forest, chore: &Chore) -> Option<u32> {
-    chore
-        .definitions
-        .iter()
-        .filter_map(|id| forest.definitions[id.0].order)
-        .max()
+fn chore_order(forest: &Forest, chore: &Chore) -> Option<ComputedOrder> {
+    computed_chore_order(forest, chore)
 }
 
 fn chore_has_wbs(forest: &Forest, chore: &Chore) -> bool {
@@ -476,7 +723,9 @@ fn chore_has_wbs(forest: &Forest, chore: &Chore) -> bool {
 }
 
 fn print_wbs_results(forest: &Forest, color: bool) {
-    print_chore_results(forest, color, |forest, chore| chore_has_wbs(forest, chore));
+    print_chore_results(forest, color, false, None, None, |forest, chore| {
+        chore_has_wbs(forest, chore)
+    });
 }
 
 fn print_chore_search_results(
@@ -485,78 +734,209 @@ fn print_chore_search_results(
     assignee_filters: &[String],
     query_terms: &[String],
     color: bool,
+    details: bool,
+    limit: Option<usize>,
+    default_assignee: Option<&str>,
 ) {
-    print_chore_results(forest, color, |forest, chore| {
-        chore_matches(forest, chore, status_filter, assignee_filters, query_terms)
-    });
+    print_chore_results(
+        forest,
+        color,
+        details,
+        limit,
+        default_assignee,
+        |forest, chore| {
+            chore_matches(
+                forest,
+                chore,
+                status_filter,
+                assignee_filters,
+                query_terms,
+                default_assignee,
+            )
+        },
+    );
 }
 
-fn print_chore_results(forest: &Forest, color: bool, matches: impl Fn(&Forest, &Chore) -> bool) {
-    let mut by_file: BTreeMap<usize, Vec<&Chore>> = BTreeMap::new();
-    for chore in forest.chores.iter().filter(|chore| matches(forest, chore)) {
-        by_file.entry(chore.file.0).or_default().push(chore);
-    }
-
-    let mut file_groups = by_file.into_iter().collect::<Vec<_>>();
-    file_groups.sort_by(|(left_id, left_chores), (right_id, right_chores)| {
-        let left_order = left_chores
-            .iter()
-            .filter_map(|chore| max_definition_order(forest, chore))
-            .max();
-        let right_order = right_chores
-            .iter()
-            .filter_map(|chore| max_definition_order(forest, chore))
-            .max();
-        right_order.cmp(&left_order).then_with(|| {
-            forest.files[*left_id]
-                .path
-                .cmp(&forest.files[*right_id].path)
-        })
+fn print_chore_results(
+    forest: &Forest,
+    color: bool,
+    details: bool,
+    limit: Option<usize>,
+    default_assignee: Option<&str>,
+    matches: impl Fn(&Forest, &Chore) -> bool,
+) {
+    let mut chores = forest
+        .chores
+        .iter()
+        .filter(|chore| matches(forest, chore))
+        .collect::<Vec<_>>();
+    chores.sort_by(|left, right| {
+        chore_sort_key(forest, left)
+            .cmp(&chore_sort_key(forest, right))
+            .then_with(|| {
+                forest.files[left.file.0]
+                    .path
+                    .cmp(&forest.files[right.file.0].path)
+            })
+            .then_with(|| left.line.cmp(&right.line))
+            .then_with(|| left.column.cmp(&right.column))
     });
 
-    for (file_id, mut chores) in file_groups {
-        chores.sort_by(|left, right| {
-            max_definition_order(forest, right)
-                .cmp(&max_definition_order(forest, left))
-                .then_with(|| left.line.cmp(&right.line))
-                .then_with(|| left.column.cmp(&right.column))
-        });
-
-        println!("{}", forest.files[file_id].path.display());
-        let mut current_order = None;
-        for chore in chores {
-            let order = max_definition_order(forest, chore);
-            if current_order != Some(order) {
-                current_order = Some(order);
-                println!("  {}", colored_order(order, color));
-            }
-            let defs = chore
-                .definitions
-                .iter()
-                .map(|id| forest.definitions[id.0].path.as_str())
-                .collect::<Vec<_>>()
-                .join(", ");
+    let mut printed = 0usize;
+    let mut current_file = None;
+    let mut current_order = None;
+    for chore in chores {
+        if limit.is_some_and(|limit| printed >= limit) {
+            break;
+        }
+        let order = chore_order(forest, chore);
+        if current_file != Some(chore.file) {
+            current_file = Some(chore.file);
+            current_order = None;
+            println!("{}", forest.files[chore.file.0].path.display());
+        }
+        if details && current_order != Some(order) {
+            current_order = Some(order);
+            println!("  {}", colored_order(order, color));
+        }
+        let defs = chore
+            .definitions
+            .iter()
+            .map(|id| forest.definitions[id.0].path.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let line = if details {
+            format!(
+                "{}  [{}]",
+                chore.text.trim(),
+                chore_tag_info(forest, chore, order, &defs, default_assignee)
+            )
+        } else {
+            chore.text.trim().to_string()
+        };
+        println!("    {}", colorize(&line, order, color));
+        if details {
             println!(
-                "    {}:{} [{}] {}",
-                chore.line,
-                chore.column,
-                defs,
-                chore.text.trim()
+                "      details: computed_{} status={} assignee={} date={} wbs={}",
+                order_label(order),
+                status_label(chore.status),
+                assignee_label(forest, chore, default_assignee),
+                option_str(chore.date.as_deref()),
+                list_or_dash(&chore.wbs)
+            );
+            println!(
+                "      definitions: {}",
+                if defs.is_empty() { "-" } else { &defs }
             );
         }
+        printed += 1;
     }
 }
 
-fn colored_order(order: Option<u32>, color: bool) -> String {
-    let label = order
-        .map(|order| format!("order={order}"))
-        .unwrap_or_else(|| "order=-".to_string());
+fn chore_tag_info(
+    forest: &Forest,
+    chore: &Chore,
+    order: Option<ComputedOrder>,
+    defs: &str,
+    default_assignee: Option<&str>,
+) -> String {
+    format!(
+        "{}:{} {} status={} assignee={} date={} wbs={} defs={}",
+        chore.line,
+        chore.column,
+        order_label(order),
+        status_label(chore.status),
+        assignee_label(forest, chore, default_assignee),
+        option_str(chore.date.as_deref()),
+        list_or_dash(&chore.wbs),
+        if defs.is_empty() { "-" } else { defs }
+    )
+}
+
+fn assignee_label(forest: &Forest, chore: &Chore, default_assignee: Option<&str>) -> String {
+    let assignees = effective_chore_assignees(forest, chore, default_assignee);
+    if assignees.is_empty() {
+        "-".to_string()
+    } else {
+        assignees.join(",")
+    }
+}
+
+fn chore_sort_key(forest: &Forest, chore: &Chore) -> (u8, std::cmp::Reverse<u32>) {
+    chore_order(forest, chore)
+        .map(|order| (1, std::cmp::Reverse(order.value)))
+        .unwrap_or((0, std::cmp::Reverse(0)))
+}
+
+fn colored_order(order: Option<ComputedOrder>, color: bool) -> String {
+    let label = order_label(order);
+    colorize(&label, order, color)
+}
+
+fn colorize(text: &str, order: Option<ComputedOrder>, color: bool) -> String {
     if !color {
-        return label;
+        return text.to_string();
     }
     match order {
-        Some(value) => format!("\x1b[{}m{label}\x1b[0m", order_color(value)),
-        None => format!("\x1b[90m{label}\x1b[0m"),
+        Some(order) => format!("\x1b[{}m{text}\x1b[0m", order_color(order.value)),
+        None => format!("\x1b[90m{text}\x1b[0m"),
+    }
+}
+
+fn order_label(order: Option<ComputedOrder>) -> String {
+    match order {
+        Some(ComputedOrder {
+            value,
+            exclusive: true,
+            conflict: true,
+        }) => format!("order={value} exclusive conflict"),
+        Some(ComputedOrder {
+            value,
+            exclusive: true,
+            conflict: false,
+        }) => format!("order={value} exclusive"),
+        Some(order) => format!("order={}", order.value),
+        None => "order=-".to_string(),
+    }
+}
+
+fn metadata_order_label(order: Option<OrderMetadata>) -> String {
+    match order {
+        Some(OrderMetadata {
+            value,
+            exclusive: true,
+        }) => format!("{value} exclusive"),
+        Some(order) => order.value.to_string(),
+        None => "-".to_string(),
+    }
+}
+
+fn status_label(status: Option<Status>) -> &'static str {
+    match status {
+        Some(Status::Todo) => "TODO",
+        Some(Status::Go) => "GO",
+        Some(Status::Done) => "DONE",
+        Some(Status::Question) => "QUESTION",
+        Some(Status::Info) => "INFO",
+        Some(Status::Wip) => "WIP",
+        Some(Status::Blocked) => "BLOCKED",
+        Some(Status::Forward) => "FORWARD",
+        Some(Status::Planned) => "PLANNED",
+        Some(Status::Canceled) => "CANCELED",
+        Some(Status::Assigned) => "ASSIGNED",
+        None => "-",
+    }
+}
+
+fn option_str(value: Option<&str>) -> &str {
+    value.unwrap_or("-")
+}
+
+fn list_or_dash(values: &[String]) -> String {
+    if values.is_empty() {
+        "-".to_string()
+    } else {
+        values.join(",")
     }
 }
 
@@ -573,7 +953,7 @@ fn order_color(order: u32) -> u8 {
 
 fn print_help() {
     println!(
-        "chimp\n\nUSAGE:\n  chimp scan [PATH...]\n  chimp groves [-C PATH]\n  chimp check [-C PATH]\n  chimp wbs [-C PATH]\n  chimp chores [-C PATH] [--status TODO|DONE|WIP] [--assignee NAME|@NAME] [QUERY...]\n  chimp export DEST [--include-amp|--strip-amp] [--status TODO|DONE|WIP] [--amp TAG] [--ext EXT] [PATH...]\n"
+        "chimp\n\nUSAGE:\n  chimp [--nocolor] [-V LEVEL|--verbose LEVEL] scan [PATH...]\n  chimp [--nocolor] [-V LEVEL|--verbose LEVEL] groves [-C PATH]\n  chimp [--nocolor] [-V LEVEL|--verbose LEVEL] check [-C PATH]\n  chimp [--nocolor] [-V LEVEL|--verbose LEVEL] debug [-C PATH]\n  chimp [--nocolor] [-V LEVEL|--verbose LEVEL] wbs [-C PATH]\n  chimp [--nocolor] [-V LEVEL|--verbose LEVEL] chores [-d|--details] [-n COUNT] [-C PATH] [--status STATUS] [--assignee NAME|@NAME] [QUERY...]\n  chimp [--nocolor] [-V LEVEL|--verbose LEVEL] export DEST [--include-amp|--strip-amp] [--status STATUS] [--amp TAG] [--ext EXT] [PATH...]\n  chimp [-V LEVEL|--verbose LEVEL] naft encode OUT.naft [-u] [-U] FOLDER...\n  chimp [-V LEVEL|--verbose LEVEL] naft decode IN.naft BASE_FOLDER\n"
     );
 }
 
@@ -596,9 +976,11 @@ mod tests {
 
     #[test]
     fn parses_per_grove_config() {
-        let groves = parse_config_groves(
+        let config = parse_config(
             Path::new("/tmp/config"),
             r#"
+default_assignee = "fallback"
+
 [[grove]]
 path = "docs"
 extensions = ["md", ".txt"]
@@ -610,13 +992,14 @@ extensions = ["rs"]
 "#,
         );
 
-        assert_eq!(groves.len(), 2);
-        assert_eq!(groves[0].root, PathBuf::from("/tmp/config/docs"));
-        assert_eq!(groves[0].extensions, vec!["md", "txt"]);
-        assert_eq!(groves[0].max_filesize, Some(1024));
-        assert_eq!(groves[1].root, PathBuf::from("/abs/src"));
-        assert_eq!(groves[1].extensions, vec!["rs"]);
-        assert_eq!(groves[1].max_filesize, None);
+        assert_eq!(config.default_assignee.as_deref(), Some("fallback"));
+        assert_eq!(config.groves.len(), 2);
+        assert_eq!(config.groves[0].root, PathBuf::from("/tmp/config/docs"));
+        assert_eq!(config.groves[0].extensions, vec!["md", "txt"]);
+        assert_eq!(config.groves[0].max_filesize, Some(1024));
+        assert_eq!(config.groves[1].root, PathBuf::from("/abs/src"));
+        assert_eq!(config.groves[1].extensions, vec!["rs"]);
+        assert_eq!(config.groves[1].max_filesize, None);
     }
 
     #[test]
@@ -629,28 +1012,55 @@ extensions = ["rs"]
             chore,
             Some(Status::Todo),
             &["geert".to_string()],
-            &["parser".to_string()]
+            &["parser".to_string()],
+            None
         ));
         assert!(!chore_matches(
             &forest,
             chore,
             Some(Status::Todo),
             &["someone".to_string()],
-            &["parser".to_string()]
+            &["parser".to_string()],
+            None
         ));
         assert!(!chore_matches(
             &forest,
             chore,
             Some(Status::Done),
             &[],
-            &["parser".to_string()]
+            &["parser".to_string()],
+            None
+        ));
+    }
+
+    #[test]
+    fn default_assignee_matches_unassigned_chores() {
+        let mut forest = sample_forest();
+        forest.definitions[0].assignee = None;
+        let chore = &forest.chores[0];
+
+        assert!(chore_matches(
+            &forest,
+            chore,
+            Some(Status::Todo),
+            &["fallback".to_string()],
+            &[],
+            Some("fallback")
+        ));
+        assert!(!chore_matches(
+            &forest,
+            chore,
+            Some(Status::Todo),
+            &["geert".to_string()],
+            &[],
+            Some("fallback")
         ));
     }
 
     #[test]
     fn max_order_comes_from_resolved_definitions() {
         let forest = sample_forest();
-        assert_eq!(max_definition_order(&forest, &forest.chores[0]), Some(12));
+        assert_eq!(chore_order(&forest, &forest.chores[0]).unwrap().value, 12);
     }
 
     #[test]
@@ -661,9 +1071,14 @@ extensions = ["rs"]
 
     #[test]
     fn order_labels_are_color_coded() {
-        assert_eq!(colored_order(Some(1), false), "order=1");
+        let order = Some(ComputedOrder {
+            value: 1,
+            exclusive: false,
+            conflict: false,
+        });
+        assert_eq!(colored_order(order, false), "order=1");
         assert_eq!(colored_order(None, false), "order=-");
-        assert_eq!(colored_order(Some(1), true), "\x1b[32morder=1\x1b[0m");
+        assert_eq!(colored_order(order, true), "\x1b[32morder=1\x1b[0m");
         assert_eq!(colored_order(None, true), "\x1b[90morder=-\x1b[0m");
     }
 
@@ -700,7 +1115,10 @@ extensions = ["rs"]
                 file: Some(FileId(0)),
                 line: Some(1),
                 date: None,
-                order: Some(12),
+                order: Some(OrderMetadata {
+                    value: 12,
+                    exclusive: false,
+                }),
                 assignee: Some("geert".to_string()),
                 wbs: vec!["project".to_string()],
             }],
