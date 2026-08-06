@@ -9,6 +9,9 @@ pub struct Metadata {
     pub date: Option<String>,
     pub order: Option<crate::OrderMetadata>,
     pub assignee: Option<String>,
+    pub assignee_exclusive: bool,
+    pub bare_assignees: Vec<String>,
+    pub empty_amp_paths: usize,
     pub wbs: Vec<String>,
 }
 
@@ -21,6 +24,7 @@ impl Metadata {
             && self.date.is_none()
             && self.order.is_none()
             && self.assignee.is_none()
+            && self.bare_assignees.is_empty()
             && self.wbs.is_empty()
     }
 
@@ -39,7 +43,14 @@ impl Metadata {
         self.checkbox = self.checkbox.or(other.checkbox);
         self.date = self.date.clone().or_else(|| other.date.clone());
         self.order = self.order.or(other.order);
-        self.assignee = self.assignee.clone().or_else(|| other.assignee.clone());
+        if other.assignee_exclusive {
+            self.assignee = other.assignee.clone();
+            self.assignee_exclusive = true;
+        } else if self.assignee.is_none() {
+            self.assignee = other.assignee.clone();
+        }
+        self.bare_assignees
+            .extend(other.bare_assignees.iter().cloned());
         self.wbs.extend(other.wbs.iter().cloned());
     }
 }
@@ -69,6 +80,7 @@ pub struct MarkdownIssue {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(clippy::enum_variant_names)]
 pub enum MarkdownIssueKind {
     UnclosedInlineCode,
     UnclosedInlineFormula,
@@ -142,24 +154,25 @@ impl MarkdownState {
 }
 
 fn is_supported_source(path: &Path) -> bool {
-    match path.extension().and_then(|ext| ext.to_str()) {
-        Some("c" | "h" | "cc" | "cpp" | "cxx" | "hpp" | "hh" | "rb" | "rs" | "zig") => true,
-        _ => false,
-    }
+    matches!(
+        path.extension().and_then(|ext| ext.to_str()),
+        Some("c" | "h" | "cc" | "cpp" | "cxx" | "hpp" | "hh" | "rb" | "rs" | "zig")
+    )
 }
 
 fn source_comment_content(line: &str) -> Option<(usize, &str)> {
     let trimmed = line.trim_start();
-    if trimmed.len() == line.len() {
-        return None;
-    }
     let whitespace = line.len() - trimmed.len();
     let content = trimmed
         .strip_prefix("//")
         .or_else(|| trimmed.strip_prefix("#"))
         .or_else(|| trimmed.strip_prefix("/*"))
         .or_else(|| trimmed.strip_prefix("*"))?;
-    Some((whitespace + 1, content.trim_start()))
+    let content = content.trim_start();
+    if !content.starts_with('&') || !content.chars().nth(1).is_some_and(is_amp_start) {
+        return None;
+    }
+    Some((whitespace + 1, content))
 }
 
 pub fn heading_level(line: &str) -> Option<usize> {
@@ -191,8 +204,9 @@ pub fn extract_metadata(line: &str) -> Metadata {
         md.status = Some(status);
     }
 
-    for word in line.split(|ch: char| !is_metadata_word_char(ch)) {
-        match word {
+    let normalized_wikilinks = normalize_wikilink_references(line);
+    for word in metadata_words(&normalized_wikilinks) {
+        match word.as_str() {
             "TODO" => md.status = Some(crate::Status::Todo),
             "GO" => md.status = Some(crate::Status::Go),
             "DONE" => md.status = Some(crate::Status::Done),
@@ -204,13 +218,27 @@ pub fn extract_metadata(line: &str) -> Metadata {
             "PLANNED" => md.status = Some(crate::Status::Planned),
             "CANCELED" | "CANCELLED" => md.status = Some(crate::Status::Canceled),
             "ASSIGNED" => md.status = Some(crate::Status::Assigned),
+            _ if is_empty_amp_path(&word) => md.empty_amp_paths += 1,
             _ if word.starts_with("&&") && word.len() > 2 => md.definitions.push(word.to_string()),
-            _ if word.starts_with('&') && word.len() > 1 => parse_amp_metadata(word, &mut md),
+            _ if word.starts_with('&') && word.len() > 1 => parse_amp_metadata(&word, &mut md),
+            _ if word.starts_with('@') && word.len() > 1 => {
+                md.bare_assignees.push(word[1..].to_ascii_lowercase());
+            }
             _ => {}
         }
     }
 
     md
+}
+
+fn is_empty_amp_path(word: &str) -> bool {
+    word.starts_with('&')
+        && word
+            .trim_start_matches('&')
+            .trim_start_matches('^')
+            .trim_matches(':')
+            .trim_matches('`')
+            .is_empty()
 }
 
 fn checkbox_status(line: &str) -> Option<crate::Status> {
@@ -266,6 +294,20 @@ fn mask_inline_code_and_math(line: &str) -> MarkdownLine {
     while let Some(ch) = chars.next() {
         match ch {
             '`' => {
+                if output
+                    .split_whitespace()
+                    .next_back()
+                    .is_some_and(|token| token.starts_with('&'))
+                {
+                    output.push(ch);
+                    for next in chars.by_ref() {
+                        output.push(next);
+                        if next == '`' {
+                            break;
+                        }
+                    }
+                    continue;
+                }
                 output.push(' ');
                 let mut closed = false;
                 for next in chars.by_ref() {
@@ -312,23 +354,28 @@ fn mask_inline_code_and_math(line: &str) -> MarkdownLine {
 }
 
 fn strip_amp_metadata_line(line: &str) -> String {
+    let line = strip_wikilink_amp_metadata(line);
     let mut output = String::with_capacity(line.len());
     let mut chars = line.char_indices().peekable();
-    while let Some((idx, ch)) = chars.next() {
+    while let Some((_, ch)) = chars.next() {
         if ch == '&' && chars.peek().is_some_and(|(_, next)| is_amp_start(*next)) {
+            let mut quoted = false;
             while let Some((_, next)) = chars.peek().copied() {
-                if !is_metadata_word_char(next) {
+                if next == '`' {
+                    quoted = !quoted;
+                    chars.next();
+                } else if quoted || is_metadata_word_char(next) {
+                    chars.next();
+                } else {
                     break;
                 }
-                chars.next();
             }
-            if idx > 0 && output.ends_with(' ') {
-                while let Some((_, next)) = chars.peek().copied() {
-                    if next == ' ' || next == '\t' {
-                        chars.next();
-                    } else {
-                        break;
-                    }
+            if output.ends_with(' ') {
+                while chars
+                    .peek()
+                    .is_some_and(|(_, next)| *next == ' ' || *next == '\t')
+                {
+                    chars.next();
                 }
             }
         } else {
@@ -338,13 +385,63 @@ fn strip_amp_metadata_line(line: &str) -> String {
     output
 }
 
+fn normalize_wikilink_references(line: &str) -> String {
+    let mut output = String::with_capacity(line.len());
+    let mut remaining = line;
+    while let Some(start) = remaining.find("&[[") {
+        let after_open = &remaining[start + 3..];
+        let Some(end) = after_open.find("]]") else {
+            break;
+        };
+        output.push_str(&remaining[..start]);
+        let target = after_open[..end].trim();
+        let path = target
+            .split('/')
+            .map(str::trim)
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join(":");
+        if path.is_empty() {
+            output.push_str("&[[");
+            output.push_str(&after_open[..end]);
+            output.push_str("]]");
+        } else {
+            output.push('&');
+            output.push_str(&path);
+        }
+        remaining = &after_open[end + 2..];
+    }
+    output.push_str(remaining);
+    output
+}
+
+fn strip_wikilink_amp_metadata(line: &str) -> String {
+    let mut output = String::with_capacity(line.len());
+    let mut remaining = line;
+    while let Some(start) = remaining.find("&[[") {
+        let after_open = &remaining[start + 3..];
+        let Some(end) = after_open.find("]]") else {
+            break;
+        };
+        output.push_str(&remaining[..start]);
+        remaining = &after_open[end + 2..];
+        if output.ends_with(' ') {
+            remaining = remaining.trim_start_matches([' ', '\t']);
+        }
+    }
+    output.push_str(remaining);
+    output
+}
+
 fn is_amp_start(ch: char) -> bool {
     ch == '&'
+        || ch == '`'
         || ch == ':'
         || ch == '#'
         || ch == '^'
         || ch == '@'
         || ch == '?'
+        || ch == '+'
         || ch.is_ascii_alphanumeric()
         || ch == '_'
 }
@@ -358,12 +455,33 @@ fn is_metadata_word_char(ch: char) -> bool {
         || ch == '^'
         || ch == '@'
         || ch == '?'
+        || ch == '+'
+}
+
+fn metadata_words(line: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut current = String::new();
+    let mut quoted = false;
+    for ch in line.chars() {
+        if ch == '`' && (quoted || current.starts_with('&')) {
+            quoted = !quoted;
+            current.push(ch);
+        } else if quoted || is_metadata_word_char(ch) {
+            current.push(ch);
+        } else if !current.is_empty() {
+            words.push(std::mem::take(&mut current));
+        }
+    }
+    if !current.is_empty() {
+        words.push(current);
+    }
+    words
 }
 
 fn parse_amp_metadata(word: &str, md: &mut Metadata) {
     let value = &word[1..];
-    if value.len() == 8 && value.chars().all(|ch| ch.is_ascii_digit()) {
-        md.date = Some(value.to_string());
+    if let Some(date) = parse_date_metadata(value) {
+        md.date = Some(date);
     } else if let Some(order) = value
         .strip_prefix("#")
         .and_then(|raw| raw.parse::<u32>().ok())
@@ -382,7 +500,13 @@ fn parse_amp_metadata(word: &str, md: &mut Metadata) {
         });
     } else if let Some(assignee) = value.strip_prefix('@') {
         if !assignee.is_empty() {
-            md.assignee = Some(assignee.to_string());
+            md.assignee = Some(assignee.to_lowercase());
+            md.assignee_exclusive = false;
+        }
+    } else if let Some(assignee) = value.strip_prefix("^@") {
+        if !assignee.is_empty() {
+            md.assignee = Some(assignee.to_lowercase());
+            md.assignee_exclusive = true;
         }
     } else if let Some(wbs) = value.strip_prefix('?') {
         if !wbs.is_empty() {
@@ -391,6 +515,84 @@ fn parse_amp_metadata(word: &str, md: &mut Metadata) {
     } else {
         md.references.push(word.to_string());
     }
+}
+
+fn parse_date_metadata(value: &str) -> Option<String> {
+    let (date, offset) = value
+        .split_once('+')
+        .map_or((value, None), |(date, offset)| (date, Some(offset)));
+    if date.len() != 8 || !date.chars().all(|ch| ch.is_ascii_digit()) {
+        return None;
+    }
+    let year = date[0..4].parse::<i32>().ok()?;
+    let month = date[4..6].parse::<u32>().ok()?;
+    let day = date[6..8].parse::<u32>().ok()?;
+    if year < 1 || !(1..=12).contains(&month) || day == 0 || day > days_in_month(year, month) {
+        return None;
+    }
+    let (year, month, day) = match offset {
+        None => (year, month, day),
+        Some(offset) => {
+            let months = offset.strip_suffix('m')?.parse::<i32>().ok()?;
+            let absolute_month = year
+                .checked_mul(12)?
+                .checked_add(month as i32 - 1)?
+                .checked_add(months)?;
+            if absolute_month < 12 {
+                return None;
+            }
+            let year = absolute_month.div_euclid(12);
+            let month = absolute_month.rem_euclid(12) as u32 + 1;
+            (year, month, day.min(days_in_month(year, month)))
+        }
+    };
+    Some(format!("{year:04}{month:02}{day:02}"))
+}
+
+pub(crate) fn date_in_path_component(value: &str) -> Option<String> {
+    let bytes = value.as_bytes();
+    let mut dates = Vec::new();
+    for start in 0..bytes.len() {
+        if start > 0 && bytes[start - 1].is_ascii_digit() {
+            continue;
+        }
+        for len in [8, 10] {
+            let Some(candidate) = value.get(start..start + len) else {
+                continue;
+            };
+            if start + len < bytes.len() && bytes[start + len].is_ascii_digit() {
+                continue;
+            }
+            let normalized = if len == 10
+                && candidate.as_bytes()[4] == b'-'
+                && candidate.as_bytes()[7] == b'-'
+            {
+                format!("{}{}{}", &candidate[..4], &candidate[5..7], &candidate[8..])
+            } else if len == 8 {
+                candidate.to_string()
+            } else {
+                continue;
+            };
+            if let Some(date) = parse_date_metadata(&normalized) {
+                dates.push(date);
+            }
+        }
+    }
+    dates.into_iter().min()
+}
+
+fn days_in_month(year: i32, month: u32) -> u32 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if is_leap_year(year) => 29,
+        2 => 28,
+        _ => 0,
+    }
+}
+
+fn is_leap_year(year: i32) -> bool {
+    year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)
 }
 
 fn strip_markdown_bullet(mut line: &str) -> &str {
@@ -435,6 +637,29 @@ mod tests {
     }
 
     #[test]
+    fn applies_month_offset_to_date_metadata() {
+        assert_eq!(
+            extract_metadata("&20260806+1m").date.as_deref(),
+            Some("20260906")
+        );
+        assert_eq!(
+            extract_metadata("&20260131+1m").date.as_deref(),
+            Some("20260228")
+        );
+        assert_eq!(
+            extract_metadata("&20240229+12m").date.as_deref(),
+            Some("20250228")
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_date_metadata_as_a_reference() {
+        let metadata = extract_metadata("&20260230");
+        assert!(metadata.date.is_none());
+        assert_eq!(metadata.references, vec!["&20260230"]);
+    }
+
+    #[test]
     fn extracts_exclusive_order_metadata() {
         let md = extract_metadata("- [ ] TODO &^#12");
         assert_eq!(
@@ -443,6 +668,69 @@ mod tests {
                 value: 12,
                 exclusive: true
             })
+        );
+    }
+
+    #[test]
+    fn extracts_exclusive_assignee_metadata() {
+        let md = extract_metadata("- [ ] task &^@geert");
+        assert_eq!(md.assignee.as_deref(), Some("geert"));
+        assert!(md.assignee_exclusive);
+    }
+
+    #[test]
+    fn collects_bare_assignee_candidates() {
+        let md = extract_metadata("- [ ] ask @Geert and @alice");
+        assert_eq!(md.bare_assignees, vec!["geert", "alice"]);
+        assert!(md.assignee.is_none());
+    }
+
+    #[test]
+    fn empty_amp_paths_are_counted_but_omitted() {
+        let md = extract_metadata("- [ ] task & && &: &^:");
+        assert_eq!(md.empty_amp_paths, 4);
+        assert!(md.references.is_empty());
+        assert!(md.definitions.is_empty());
+    }
+
+    #[test]
+    fn extracts_dates_from_path_components() {
+        assert_eq!(
+            date_in_path_component("meeting-2026-08-06-notes.md").as_deref(),
+            Some("20260806")
+        );
+        assert_eq!(
+            date_in_path_component("backup_20260807.txt").as_deref(),
+            Some("20260807")
+        );
+        assert!(date_in_path_component("invalid-2026-02-30.md").is_none());
+    }
+
+    #[test]
+    fn wikilink_references_are_normalized_in_source_order() {
+        let md = extract_metadata("- [ ] &before &[[a/b]] &after");
+        assert_eq!(md.references, vec!["&before", "&a:b", "&after"]);
+    }
+
+    #[test]
+    fn strips_complete_wikilink_metadata() {
+        assert_eq!(
+            strip_amp_metadata("- [ ] Read &[[a/b]] today\n"),
+            "- [ ] Read today\n"
+        );
+    }
+
+    #[test]
+    fn backticks_quote_amp_path_spaces_and_colons() {
+        let md = extract_metadata("- [ ] &root:`part one:two`:leaf work");
+        assert_eq!(md.references, vec!["&root:`part one:two`:leaf"]);
+    }
+
+    #[test]
+    fn strips_amp_paths_with_backtick_quoted_segments() {
+        assert_eq!(
+            strip_amp_metadata("- [ ] Read &root:`part one:two`:leaf today\n"),
+            "- [ ] Read today\n"
         );
     }
 
@@ -532,8 +820,15 @@ mod tests {
     }
 
     #[test]
-    fn recognizes_indented_source_comments_only() {
-        assert_eq!(source_comment_content("  // TODO x").unwrap().1, "TODO x");
-        assert!(source_comment_content("// TODO x").is_none());
+    fn recognizes_source_comments_that_begin_with_amp_path() {
+        assert_eq!(
+            source_comment_content("  // &task TODO x").unwrap().1,
+            "&task TODO x"
+        );
+        assert!(source_comment_content("  // TODO &task x").is_none());
+        assert_eq!(
+            source_comment_content("// &task TODO x").unwrap().1,
+            "&task TODO x"
+        );
     }
 }

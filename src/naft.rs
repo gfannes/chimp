@@ -90,6 +90,15 @@ pub fn encode_folders_with_options(
 }
 
 pub fn decode_to_base(nodes: &[Node], base: impl AsRef<Path>) -> Result<()> {
+    decode_to_base_with_reporter(nodes, base, 0, |_| {})
+}
+
+pub fn decode_to_base_with_reporter(
+    nodes: &[Node],
+    base: impl AsRef<Path>,
+    verbose: u8,
+    mut log: impl FnMut(&Path),
+) -> Result<()> {
     let base = base.as_ref();
     let mut targets = Vec::new();
     for node in nodes {
@@ -99,7 +108,7 @@ pub fn decode_to_base(nodes: &[Node], base: impl AsRef<Path>) -> Result<()> {
         return Err(format!("decode target already exists: {}", existing.display()).into());
     }
     for node in nodes {
-        write_node(node, base)?;
+        write_node(node, base, verbose, &mut log)?;
     }
     Ok(())
 }
@@ -120,7 +129,7 @@ fn encode_folder(
         .ok_or_else(|| format!("folder has no valid name: {}", path.display()))?;
     let mut ignore = inherited_ignore;
     if !options.include_ignored {
-        ignore.extend(read_gitignore(path)?);
+        ignore.extend(read_gitignore(root, path)?);
     }
     let mut entries = fs::read_dir(path)?.collect::<std::io::Result<Vec<_>>>()?;
     entries.sort_by_key(|entry| entry.path());
@@ -165,13 +174,16 @@ fn collect_targets(node: &Node, base: &Path, targets: &mut Vec<PathBuf>) -> Resu
     Ok(())
 }
 
-fn write_node(node: &Node, base: &Path) -> Result<()> {
+fn write_node(node: &Node, base: &Path, verbose: u8, log: &mut impl FnMut(&Path)) -> Result<()> {
     let path = child_path(base, node)?;
+    if verbose >= 3 {
+        log(&path);
+    }
     match node.tag.as_str() {
         "Folder" => {
             fs::create_dir(&path)?;
             for child in &node.children {
-                write_node(child, &path)?;
+                write_node(child, &path, verbose, log)?;
             }
         }
         "File" => {
@@ -201,9 +213,11 @@ fn child_path(base: &Path, node: &Node) -> Result<PathBuf> {
 #[derive(Debug, Clone)]
 struct IgnorePattern {
     raw: String,
+    base: PathBuf,
+    anchored: bool,
 }
 
-fn read_gitignore(dir: &Path) -> Result<Vec<IgnorePattern>> {
+fn read_gitignore(root: &Path, dir: &Path) -> Result<Vec<IgnorePattern>> {
     let path = dir.join(".gitignore");
     if !path.exists() {
         return Ok(Vec::new());
@@ -214,7 +228,9 @@ fn read_gitignore(dir: &Path) -> Result<Vec<IgnorePattern>> {
         .map(str::trim)
         .filter(|line| !line.is_empty() && !line.starts_with('#') && !line.starts_with('!'))
         .map(|line| IgnorePattern {
-            raw: line.trim_end_matches('/').to_string(),
+            raw: line.trim_matches('/').to_string(),
+            base: dir.strip_prefix(root).unwrap_or(dir).to_path_buf(),
+            anchored: line.starts_with('/') || line.trim_matches('/').contains('/'),
         })
         .collect())
 }
@@ -222,7 +238,12 @@ fn read_gitignore(dir: &Path) -> Result<Vec<IgnorePattern>> {
 fn ignored(root: &Path, path: &Path, name: &str, patterns: &[IgnorePattern]) -> bool {
     let relative = path.strip_prefix(root).unwrap_or(path).to_string_lossy();
     patterns.iter().any(|pattern| {
-        pattern.raw == name
+        let from_base = path
+            .strip_prefix(root.join(&pattern.base))
+            .unwrap_or(path)
+            .to_string_lossy();
+        (!pattern.anchored && pattern.raw == name)
+            || pattern.raw == from_base
             || pattern.raw == relative
             || (pattern.raw.starts_with("*.") && name.ends_with(&pattern.raw[1..]))
     })
@@ -638,6 +659,34 @@ mod tests {
         assert!(serialized.contains("ignored.txt"));
         assert!(serialized.contains(".gitignore"));
 
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn encode_honors_anchored_directory_gitignore_patterns() {
+        let root = test_dir("anchored-ignore");
+        fs::write(root.join(".gitignore"), "/target/\n").unwrap();
+        fs::create_dir(root.join("target")).unwrap();
+        fs::write(root.join("target").join("ignored.txt"), "ignored").unwrap();
+        fs::create_dir(root.join("nested")).unwrap();
+        fs::create_dir(root.join("nested").join("target")).unwrap();
+        fs::write(root.join("nested").join("target").join("kept.txt"), "kept").unwrap();
+
+        let default_nodes = encode_folders(std::slice::from_ref(&root)).unwrap();
+        let default_text = serialize_document(&default_nodes);
+        assert!(!default_text.contains("ignored.txt"));
+        assert!(default_text.contains("kept.txt"));
+
+        let included_nodes = encode_folders_with_options(
+            std::slice::from_ref(&root),
+            &EncodeOptions {
+                include_ignored: true,
+                ..EncodeOptions::default()
+            },
+            |_| {},
+        )
+        .unwrap();
+        assert!(serialize_document(&included_nodes).contains("ignored.txt"));
         fs::remove_dir_all(root).unwrap();
     }
 

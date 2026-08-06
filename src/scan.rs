@@ -1,17 +1,40 @@
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::{Config, FileId, GroveConfig, Result, SourceFile};
 
 pub fn load_files(config: &Config) -> Result<Vec<SourceFile>> {
+    load_files_with_reporter(config, 0, |_| {})
+}
+
+pub fn load_files_with_reporter(
+    config: &Config,
+    verbose: u8,
+    mut report: impl FnMut(&Path),
+) -> Result<Vec<SourceFile>> {
     let mut files = Vec::new();
     for (grove, grove_config) in config.groves.iter().enumerate() {
-        let root = grove_config.root.canonicalize()?;
-        walk_root(grove, grove_config, &root, &root, Vec::new(), &mut files)?;
+        let root = grove_config.root.canonicalize().map_err(|error| {
+            format!(
+                "failed to access Grove {}: {error}",
+                grove_config.root.display()
+            )
+        })?;
+        walk_root(
+            grove,
+            grove_config,
+            &root,
+            &root,
+            Vec::new(),
+            &mut files,
+            verbose,
+            &mut report,
+        )?;
     }
     Ok(files)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn walk_root(
     grove: usize,
     grove_config: &GroveConfig,
@@ -19,9 +42,14 @@ fn walk_root(
     dir: &Path,
     inherited_ignore: Vec<IgnorePattern>,
     files: &mut Vec<SourceFile>,
+    verbose: u8,
+    report: &mut impl FnMut(&Path),
 ) -> Result<()> {
+    if verbose >= 3 {
+        report(dir);
+    }
     let mut ignore = inherited_ignore;
-    ignore.extend(read_gitignore(dir)?);
+    ignore.extend(read_gitignore(root, dir)?);
 
     let mut entries = fs::read_dir(dir)?.collect::<std::io::Result<Vec<_>>>()?;
     entries.sort_by_key(|entry| entry.path());
@@ -38,7 +66,16 @@ fn walk_root(
 
         let file_type = entry.file_type()?;
         if file_type.is_dir() {
-            walk_root(grove, grove_config, root, &path, ignore.clone(), files)?;
+            walk_root(
+                grove,
+                grove_config,
+                root,
+                &path,
+                ignore.clone(),
+                files,
+                verbose,
+                report,
+            )?;
         } else if file_type.is_file() && is_supported_file(&path, grove_config) {
             if grove_config
                 .max_filesize
@@ -46,7 +83,11 @@ fn walk_root(
             {
                 continue;
             }
-            let bytes = fs::read(&path)?;
+            if verbose >= 3 {
+                report(&path);
+            }
+            let bytes = fs::read(&path)
+                .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
             let text = String::from_utf8_lossy(&bytes).into_owned();
             let id = FileId(files.len());
             files.push(SourceFile {
@@ -90,9 +131,11 @@ pub fn write_file_exact(file: &SourceFile, destination: impl AsRef<Path>) -> Res
 #[derive(Debug, Clone)]
 struct IgnorePattern {
     raw: String,
+    base: PathBuf,
+    anchored: bool,
 }
 
-fn read_gitignore(dir: &Path) -> Result<Vec<IgnorePattern>> {
+fn read_gitignore(root: &Path, dir: &Path) -> Result<Vec<IgnorePattern>> {
     let path = dir.join(".gitignore");
     if !path.exists() {
         return Ok(Vec::new());
@@ -103,7 +146,9 @@ fn read_gitignore(dir: &Path) -> Result<Vec<IgnorePattern>> {
         .map(str::trim)
         .filter(|line| !line.is_empty() && !line.starts_with('#') && !line.starts_with('!'))
         .map(|line| IgnorePattern {
-            raw: line.trim_end_matches('/').to_string(),
+            raw: line.trim_matches('/').to_string(),
+            base: dir.strip_prefix(root).unwrap_or(dir).to_path_buf(),
+            anchored: line.starts_with('/') || line.trim_matches('/').contains('/'),
         })
         .collect())
 }
@@ -111,7 +156,12 @@ fn read_gitignore(dir: &Path) -> Result<Vec<IgnorePattern>> {
 fn ignored(root: &Path, path: &Path, name: &str, patterns: &[IgnorePattern]) -> bool {
     let relative = path.strip_prefix(root).unwrap_or(path).to_string_lossy();
     patterns.iter().any(|pattern| {
-        pattern.raw == name
+        let from_base = path
+            .strip_prefix(root.join(&pattern.base))
+            .unwrap_or(path)
+            .to_string_lossy();
+        (!pattern.anchored && pattern.raw == name)
+            || pattern.raw == from_base
             || pattern.raw == relative
             || (pattern.raw.starts_with("*.") && name.ends_with(&pattern.raw[1..]))
     })
@@ -159,6 +209,26 @@ mod tests {
 
         assert_eq!(files.len(), 1);
         assert!(files[0].path.ends_with("keep.todo"));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn honors_anchored_directory_gitignore_patterns() {
+        let dir = test_dir("anchored-ignore");
+        fs::write(dir.join(".gitignore"), "/target/\n").unwrap();
+        fs::create_dir(dir.join("target")).unwrap();
+        fs::write(dir.join("target").join("ignored.md"), "TODO &ignored\n").unwrap();
+        fs::create_dir(dir.join("nested")).unwrap();
+        fs::create_dir(dir.join("nested").join("target")).unwrap();
+        fs::write(
+            dir.join("nested").join("target").join("kept.md"),
+            "TODO &kept\n",
+        )
+        .unwrap();
+
+        let files = load_files(&Config::from_roots(vec![dir.clone()])).unwrap();
+        assert_eq!(files.len(), 1);
+        assert!(files[0].path.ends_with("nested/target/kept.md"));
         fs::remove_dir_all(dir).unwrap();
     }
 

@@ -7,7 +7,7 @@ use std::fs;
 use std::path::{Component, Path, PathBuf};
 
 pub use parse::{Metadata, extract_metadata};
-pub use scan::{load_files, write_file_exact};
+pub use scan::{load_files, load_files_with_reporter, write_file_exact};
 
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -87,12 +87,16 @@ pub struct Definition {
     pub id: DefinitionId,
     pub path: String,
     pub is_phony: bool,
+    pub exclusive: bool,
+    pub is_assignee: bool,
     pub file: Option<FileId>,
     pub line: Option<usize>,
     pub date: Option<String>,
     pub order: Option<OrderMetadata>,
     pub assignee: Option<String>,
+    pub assignee_exclusive: bool,
     pub wbs: Vec<String>,
+    pub definitions: Vec<DefinitionId>,
 }
 
 #[derive(Debug, Clone)]
@@ -105,6 +109,7 @@ pub struct Chore {
     pub date: Option<String>,
     pub order: Option<OrderMetadata>,
     pub assignee: Option<String>,
+    pub assignee_exclusive: bool,
     pub wbs: Vec<String>,
     pub definitions: Vec<DefinitionId>,
 }
@@ -129,10 +134,14 @@ pub struct CheckIssue {
 pub enum CheckIssueKind {
     UnresolvedAmpPath,
     AmbiguousAmpPath,
+    AmbiguousDefinition,
+    UnresolvedAssignee,
+    AmbiguousAssignee,
     RelativeDefinitionWithoutParent,
     WbsWithoutDefinition,
     MarkdownParsing,
     ConflictingExclusiveOrder,
+    EmptyAmpPath,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -281,9 +290,7 @@ fn export_chore_matches(forest: &Forest, chore: &Chore, options: &ExportOptions)
         let tag = normalize_amp_path(tag);
         chore.definitions.iter().any(|id| {
             let path = forest.definitions[id.0].path.as_str();
-            path == tag
-                || path.ends_with(&format!(":{tag}"))
-                || path.split(':').next_back().is_some_and(|tail| tail == tag)
+            path == tag || path.ends_with(&format!(":{tag}")) || amp_path_tail(path) == tag
         })
     })
 }
@@ -301,19 +308,42 @@ struct ParsedLine {
 
 pub fn build_forest(config: &Config) -> Result<Forest> {
     let files = load_files(config)?;
+    Ok(build_forest_from_files(files))
+}
+
+pub fn build_forest_with_reporter(
+    config: &Config,
+    verbose: u8,
+    report: impl FnMut(&Path),
+) -> Result<Forest> {
+    let files = load_files_with_reporter(config, verbose, report)?;
+    Ok(build_forest_from_files(files))
+}
+
+fn build_forest_from_files(files: Vec<SourceFile>) -> Forest {
     let mut builder = ForestBuilder::new(files);
     builder.parse_files();
-    Ok(builder.finish())
+    builder.finish()
 }
 
 struct ForestBuilder {
     files: Vec<SourceFile>,
     definitions: Vec<Definition>,
     definition_by_path: HashMap<String, DefinitionId>,
+    definition_declarations: HashMap<String, Vec<DefinitionDeclaration>>,
     parsed_lines: Vec<ParsedLine>,
     folder_metadata: HashMap<(usize, PathBuf), Metadata>,
     file_metadata: HashMap<FileId, Metadata>,
+    filesystem_definition_by_file: HashMap<FileId, DefinitionId>,
     issues: Vec<CheckIssue>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DefinitionDeclaration {
+    file: FileId,
+    line: usize,
+    exclusive: bool,
+    is_assignee: bool,
 }
 
 impl ForestBuilder {
@@ -322,9 +352,11 @@ impl ForestBuilder {
             files,
             definitions: Vec::new(),
             definition_by_path: HashMap::new(),
+            definition_declarations: HashMap::new(),
             parsed_lines: Vec::new(),
             folder_metadata: HashMap::new(),
             file_metadata: HashMap::new(),
+            filesystem_definition_by_file: HashMap::new(),
             issues: Vec::new(),
         }
     }
@@ -333,6 +365,10 @@ impl ForestBuilder {
         for index in 0..self.files.len() {
             self.parse_file(FileId(index));
         }
+        self.validate_definitions();
+        self.validate_assignees();
+        self.resolve_bare_assignees();
+        self.build_filesystem_definitions();
     }
 
     fn parse_file(&mut self, file_id: FileId) {
@@ -349,6 +385,7 @@ impl ForestBuilder {
         let mut bullet_stack: Vec<(usize, Metadata)> = Vec::new();
         let mut folder_md = Metadata::default();
         let mut markdown_state = parse::MarkdownState::default();
+        let filesystem_date = date_from_file_path(&path, &file.root);
 
         let lines = text
             .lines()
@@ -380,7 +417,20 @@ impl ForestBuilder {
             } else {
                 content.text
             };
-            let metadata = extract_metadata(metadata_source);
+            let mut metadata = extract_metadata(metadata_source);
+            for _ in 0..metadata.empty_amp_paths {
+                self.issues.push(CheckIssue {
+                    kind: CheckIssueKind::EmptyAmpPath,
+                    file: Some(file_id),
+                    line: Some(line_no),
+                    message: "empty AmpPath is not allowed and was omitted".to_string(),
+                });
+            }
+            if let Some(date) = filesystem_date.as_ref()
+                && metadata.date.as_ref().is_none_or(|current| date < current)
+            {
+                metadata.date = Some(date.clone());
+            }
             if !metadata.wbs.is_empty() && metadata.definitions.is_empty() {
                 self.issues.push(CheckIssue {
                     kind: CheckIssueKind::WbsWithoutDefinition,
@@ -426,7 +476,26 @@ impl ForestBuilder {
                     });
                 }
                 let path = resolve_definition_path(amp, inherited.last());
-                self.upsert_definition(&path, false, Some(file_id), Some(line_no), &metadata);
+                let exclusive = definition_is_exclusive(amp);
+                let is_assignee = definition_is_assignee(amp);
+                self.definition_declarations
+                    .entry(path.clone())
+                    .or_default()
+                    .push(DefinitionDeclaration {
+                        file: file_id,
+                        line: line_no,
+                        exclusive,
+                        is_assignee,
+                    });
+                self.upsert_definition(
+                    &path,
+                    false,
+                    Some(file_id),
+                    Some(line_no),
+                    &metadata,
+                    exclusive,
+                    is_assignee,
+                );
             }
 
             if metadata.is_chore_marker() {
@@ -470,11 +539,12 @@ impl ForestBuilder {
             }
         }
 
-        if is_folder_metadata && !folder_md.is_empty() {
-            if let Some(parent) = path.parent() {
-                self.folder_metadata
-                    .insert((grove, parent.to_path_buf()), folder_md);
-            }
+        if is_folder_metadata
+            && !folder_md.is_empty()
+            && let Some(parent) = path.parent()
+        {
+            self.folder_metadata
+                .insert((grove, parent.to_path_buf()), folder_md);
         }
     }
 
@@ -521,6 +591,7 @@ impl ForestBuilder {
         refs
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn upsert_definition(
         &mut self,
         path: &str,
@@ -528,15 +599,33 @@ impl ForestBuilder {
         file: Option<FileId>,
         line: Option<usize>,
         md: &Metadata,
+        exclusive: bool,
+        is_assignee: bool,
     ) -> DefinitionId {
         if let Some(id) = self.definition_by_path.get(path).copied() {
             let def = &mut self.definitions[id.0];
+            if exclusive && !def.exclusive {
+                def.file = file;
+                def.line = line;
+                def.date = md.date.clone();
+                def.order = md.order;
+                def.assignee = md.assignee.clone();
+                def.assignee_exclusive = md.assignee_exclusive;
+                def.wbs = md.wbs.clone();
+            }
             def.is_phony &= is_phony;
+            def.exclusive |= exclusive;
+            def.is_assignee |= is_assignee;
             def.file = def.file.or(file);
             def.line = def.line.or(line);
             def.date = def.date.clone().or_else(|| md.date.clone());
             def.order = def.order.or(md.order);
-            def.assignee = def.assignee.clone().or_else(|| md.assignee.clone());
+            if md.assignee_exclusive {
+                def.assignee = md.assignee.clone();
+                def.assignee_exclusive = true;
+            } else if def.assignee.is_none() {
+                def.assignee = md.assignee.clone();
+            }
             for wbs in &md.wbs {
                 if !def.wbs.contains(wbs) {
                     def.wbs.push(wbs.clone());
@@ -550,19 +639,109 @@ impl ForestBuilder {
             id,
             path: path.to_string(),
             is_phony,
+            exclusive,
+            is_assignee,
             file,
             line,
             date: md.date.clone(),
             order: md.order,
             assignee: md.assignee.clone(),
+            assignee_exclusive: md.assignee_exclusive,
             wbs: md.wbs.clone(),
+            definitions: Vec::new(),
         });
         id
+    }
+
+    fn validate_definitions(&mut self) {
+        for (path, declarations) in &self.definition_declarations {
+            if declarations.len() < 2 {
+                continue;
+            }
+            let exclusive = declarations.iter().filter(|decl| decl.exclusive).count();
+            if exclusive == 1 {
+                self.issues.retain(|issue| {
+                    issue.kind != CheckIssueKind::RelativeDefinitionWithoutParent
+                        || !declarations.iter().any(|declaration| {
+                            issue.file == Some(declaration.file)
+                                && issue.line == Some(declaration.line)
+                        })
+                });
+                continue;
+            }
+            for declaration in declarations {
+                self.issues.push(CheckIssue {
+                    kind: CheckIssueKind::AmbiguousDefinition,
+                    file: Some(declaration.file),
+                    line: Some(declaration.line),
+                    message: format!(
+                        "Definition {path} is declared {} times; mark exactly one declaration exclusive with ^",
+                        declarations.len()
+                    ),
+                });
+            }
+        }
+    }
+
+    fn validate_assignees(&mut self) {
+        let mut assignees: HashMap<&str, Vec<&DefinitionDeclaration>> = HashMap::new();
+        for (path, declarations) in &self.definition_declarations {
+            for declaration in declarations.iter().filter(|decl| decl.is_assignee) {
+                assignees.entry(path).or_default().push(declaration);
+            }
+        }
+        for line in &self.parsed_lines {
+            let Some(name) = line.metadata.assignee.as_deref() else {
+                continue;
+            };
+            match assignees.get(name).map(Vec::as_slice).unwrap_or_default() {
+                [] => self.issues.push(CheckIssue {
+                    kind: CheckIssueKind::UnresolvedAssignee,
+                    file: Some(line.file),
+                    line: Some(line.line),
+                    message: format!("assignee @{name} has no matching &&@{name} Definition"),
+                }),
+                declarations
+                    if declarations.len() > 1
+                        && declarations.iter().filter(|decl| decl.exclusive).count() != 1 =>
+                {
+                    self.issues.push(CheckIssue {
+                        kind: CheckIssueKind::AmbiguousAssignee,
+                        file: Some(line.file),
+                        line: Some(line.line),
+                        message: format!("assignee @{name} matches multiple &&@{name} Definitions"),
+                    });
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn resolve_bare_assignees(&mut self) {
+        let assignees = self
+            .definition_declarations
+            .iter()
+            .filter(|(_, declarations)| declarations.iter().any(|item| item.is_assignee))
+            .map(|(path, _)| path.clone())
+            .collect::<HashSet<_>>();
+        for line in &mut self.parsed_lines {
+            if line.metadata.assignee.is_some() {
+                continue;
+            }
+            line.metadata.assignee = line
+                .metadata
+                .bare_assignees
+                .iter()
+                .rev()
+                .find(|name| assignees.contains(*name))
+                .cloned();
+        }
     }
 
     fn finish(mut self) -> Forest {
         let mut chores = Vec::new();
         let parsed_lines = std::mem::take(&mut self.parsed_lines);
+        self.inject_definition_relationships(&parsed_lines);
         for line in parsed_lines.into_iter().filter(|line| line.is_chore) {
             let mut inherited_amp_paths = self.folder_context(line.file);
             if let Some(md) = self.file_metadata.get(&line.file) {
@@ -573,6 +752,11 @@ impl ForestBuilder {
 
             let mut ids = Vec::new();
             let mut seen = HashSet::new();
+            if let Some(id) = self.filesystem_definition_by_file.get(&line.file).copied()
+                && seen.insert(id)
+            {
+                ids.push(id);
+            }
             let inherited_metadata = Metadata::default();
             for amp in inherited_amp_paths {
                 push_resolved_amp(
@@ -586,6 +770,9 @@ impl ForestBuilder {
                 );
             }
             for amp in line.metadata.references.iter() {
+                if is_injection_amp_path(amp) {
+                    continue;
+                }
                 push_resolved_amp(
                     &mut self,
                     &mut ids,
@@ -608,6 +795,8 @@ impl ForestBuilder {
                 );
             }
             add_existing_ancestor_definitions(&self, &mut ids, &mut seen);
+            add_injected_definitions(&self, &mut ids, &mut seen);
+            add_existing_ancestor_definitions(&self, &mut ids, &mut seen);
 
             let chore = Chore {
                 file: line.file,
@@ -618,6 +807,7 @@ impl ForestBuilder {
                 date: line.metadata.date,
                 order: line.metadata.order,
                 assignee: line.metadata.assignee,
+                assignee_exclusive: line.metadata.assignee_exclusive,
                 wbs: line.metadata.wbs,
                 definitions: ids,
             };
@@ -633,12 +823,227 @@ impl ForestBuilder {
             }
             chores.push(chore);
         }
+        self.add_filename_chores(&mut chores);
 
         Forest {
             files: self.files,
             definitions: self.definitions,
             chores,
             issues: self.issues,
+        }
+    }
+
+    fn add_filename_chores(&mut self, chores: &mut Vec<Chore>) {
+        let files = self.files.clone();
+        for file in files {
+            let Some(stem) = file.path.file_stem().and_then(|stem| stem.to_str()) else {
+                continue;
+            };
+            let Some(status) = filename_status(stem) else {
+                continue;
+            };
+
+            let mut ids = Vec::new();
+            let mut seen = HashSet::new();
+            if let Some(id) = self.filesystem_definition_by_file.get(&file.id).copied()
+                && seen.insert(id)
+            {
+                ids.push(id);
+            }
+            let inherited_metadata = Metadata::default();
+            let mut inherited_amp_paths = self.folder_context(file.id);
+            if let Some(metadata) = self.file_metadata.get(&file.id) {
+                inherited_amp_paths.extend(metadata.references.iter().cloned());
+                inherited_amp_paths.extend(metadata.definitions.iter().cloned());
+            }
+            for amp in inherited_amp_paths {
+                push_resolved_amp(
+                    self,
+                    &mut ids,
+                    &mut seen,
+                    &amp,
+                    &inherited_metadata,
+                    file.id,
+                    1,
+                );
+            }
+            add_existing_ancestor_definitions(self, &mut ids, &mut seen);
+            add_injected_definitions(self, &mut ids, &mut seen);
+            add_existing_ancestor_definitions(self, &mut ids, &mut seen);
+
+            chores.push(Chore {
+                file: file.id,
+                line: 1,
+                column: 1,
+                text: format!(
+                    "- [{}] {stem}",
+                    if status == Status::Todo { " " } else { "x" }
+                ),
+                status: Some(status),
+                date: date_from_file_path(&file.path, &file.root),
+                order: None,
+                assignee: None,
+                assignee_exclusive: false,
+                wbs: Vec::new(),
+                definitions: ids,
+            });
+        }
+    }
+
+    fn build_filesystem_definitions(&mut self) {
+        let files = self.files.clone();
+        for file in files {
+            if file.path.file_name().and_then(|name| name.to_str()) == Some("&.md") {
+                continue;
+            }
+            let mut directories = Vec::new();
+            let mut current = file.path.parent();
+            while let Some(dir) = current {
+                if !dir.starts_with(&file.root) {
+                    break;
+                }
+                directories.push(dir.to_path_buf());
+                if dir == file.root {
+                    break;
+                }
+                current = dir.parent();
+            }
+            directories.reverse();
+
+            let mut active: Option<(String, PathBuf)> = None;
+            for directory in directories {
+                let Some(metadata) = self
+                    .folder_metadata
+                    .get(&(file.grove, directory.clone()))
+                    .cloned()
+                else {
+                    continue;
+                };
+                if metadata.definitions.is_empty() {
+                    continue;
+                }
+                let inherited = active.as_ref().map(|(base, base_dir)| {
+                    append_filesystem_components(base, base_dir, &directory)
+                });
+                active = None;
+                for definition in metadata.definitions.iter() {
+                    if definition_is_filesystem(definition) {
+                        let path = resolve_definition_path(definition, inherited.as_ref());
+                        active = Some((path, directory.clone()));
+                    }
+                }
+            }
+
+            if let Some(metadata) = self.file_metadata.get(&file.id).cloned()
+                && !metadata.definitions.is_empty()
+            {
+                let inherited = active.as_ref().map(|(base, base_dir)| {
+                    append_filesystem_components(
+                        base,
+                        base_dir,
+                        file.path.parent().unwrap_or(&file.root),
+                    )
+                });
+                active = None;
+                for definition in metadata.definitions.iter() {
+                    if definition_is_filesystem(definition) {
+                        active = Some((
+                            resolve_definition_path(definition, inherited.as_ref()),
+                            file.path.parent().unwrap_or(&file.root).to_path_buf(),
+                        ));
+                    }
+                }
+            }
+
+            let Some((base, base_dir)) = active else {
+                continue;
+            };
+            let relative = file.path.strip_prefix(&base_dir).unwrap_or(&file.path);
+            let mut path = base;
+            let components = relative.components().collect::<Vec<_>>();
+            for (index, component) in components.iter().enumerate() {
+                let raw = component.as_os_str().to_string_lossy();
+                let value = if index + 1 == components.len() {
+                    Path::new(raw.as_ref())
+                        .file_stem()
+                        .and_then(|stem| stem.to_str())
+                        .unwrap_or(raw.as_ref())
+                        .to_string()
+                } else {
+                    raw.to_string()
+                };
+                let part = filesystem_amp_part(&value);
+                if part.is_empty() {
+                    continue;
+                }
+                path = format!("{path}:{part}");
+                let id = self.upsert_definition(
+                    &path,
+                    false,
+                    Some(file.id),
+                    Some(1),
+                    &Metadata::default(),
+                    false,
+                    false,
+                );
+                if index + 1 == components.len() {
+                    self.filesystem_definition_by_file.insert(file.id, id);
+                }
+            }
+        }
+    }
+
+    fn inject_definition_relationships(&mut self, lines: &[ParsedLine]) {
+        for line in lines {
+            let targets = line
+                .metadata
+                .references
+                .iter()
+                .filter(|amp| is_injection_amp_path(amp))
+                .cloned()
+                .collect::<Vec<_>>();
+            if targets.is_empty() {
+                continue;
+            }
+            let sources = line
+                .metadata
+                .references
+                .iter()
+                .filter(|amp| !is_injection_amp_path(amp))
+                .chain(line.metadata.definitions.iter())
+                .cloned()
+                .collect::<Vec<_>>();
+            let mut source_ids = Vec::new();
+            for source in sources {
+                let id = if source.starts_with("&&") {
+                    let path = resolve_definition_path(&source, None);
+                    self.upsert_definition(
+                        &path,
+                        false,
+                        Some(line.file),
+                        Some(line.line),
+                        &line.metadata,
+                        definition_is_exclusive(&source),
+                        definition_is_assignee(&source),
+                    )
+                } else {
+                    self.resolve_reference(&source, &line.metadata, line.file, line.line)
+                };
+                if !source_ids.contains(&id) {
+                    source_ids.push(id);
+                }
+            }
+            for target in targets {
+                let target_amp = target.trim_end_matches('&');
+                let target_id =
+                    self.resolve_reference(target_amp, &line.metadata, line.file, line.line);
+                let definition = &mut self.definitions[target_id.0];
+                for source_id in &source_ids {
+                    if *source_id != target_id && !definition.definitions.contains(source_id) {
+                        definition.definitions.push(*source_id);
+                    }
+                }
+            }
         }
     }
 
@@ -654,20 +1059,25 @@ impl ForestBuilder {
             return id;
         }
         let suffix = format!(":{reference}");
-        let matches = self
+        let direct_matches = self
             .definitions
             .iter()
             .filter(|def| {
                 def.path == reference
                     || def.path.ends_with(&suffix)
-                    || def
-                        .path
-                        .split(':')
-                        .next_back()
-                        .is_some_and(|tail| tail == reference)
+                    || amp_path_tail(&def.path) == reference
             })
             .map(|def| def.id)
             .collect::<Vec<_>>();
+        let matches = if direct_matches.is_empty() {
+            self.definitions
+                .iter()
+                .filter(|def| amp_path_partial_match(&reference, &def.path))
+                .map(|def| def.id)
+                .collect::<Vec<_>>()
+        } else {
+            direct_matches
+        };
         match matches.as_slice() {
             [id] => *id,
             [] => {
@@ -677,7 +1087,7 @@ impl ForestBuilder {
                     line: Some(line),
                     message: format!("AmpPath {amp} could not be resolved to a Definition"),
                 });
-                self.upsert_definition(&reference, true, Some(file), Some(line), md)
+                self.upsert_definition(&reference, true, Some(file), Some(line), md, false, false)
             }
             _ => {
                 let candidates = matches
@@ -691,9 +1101,30 @@ impl ForestBuilder {
                     line: Some(line),
                     message: format!("AmpPath {amp} is ambiguous; candidates: {candidates}"),
                 });
-                self.upsert_definition(&reference, true, Some(file), Some(line), md)
+                self.upsert_definition(&reference, true, Some(file), Some(line), md, false, false)
             }
         }
+    }
+}
+
+fn is_injection_amp_path(amp: &str) -> bool {
+    !amp.starts_with("&&") && amp.ends_with('&') && amp.len() > 2
+}
+
+fn add_injected_definitions(
+    builder: &ForestBuilder,
+    ids: &mut Vec<DefinitionId>,
+    seen: &mut HashSet<DefinitionId>,
+) {
+    let mut index = 0;
+    while index < ids.len() {
+        let id = ids[index];
+        for related in &builder.definitions[id.0].definitions {
+            if seen.insert(*related) {
+                ids.push(*related);
+            }
+        }
+        index += 1;
     }
 }
 
@@ -708,14 +1139,11 @@ fn add_existing_ancestor_definitions(
         .collect::<Vec<_>>();
     for path in paths {
         let mut current = path.as_str();
-        while let Some((parent, _)) = current.rsplit_once(':') {
-            if parent.is_empty() {
-                break;
-            }
-            if let Some(id) = builder.definition_by_path.get(parent).copied() {
-                if seen.insert(id) {
-                    ids.push(id);
-                }
+        while let Some(parent) = amp_path_parent(current) {
+            if let Some(id) = builder.definition_by_path.get(parent).copied()
+                && seen.insert(id)
+            {
+                ids.push(id);
             }
             current = parent;
         }
@@ -772,7 +1200,15 @@ fn push_resolved_amp(
 ) {
     let id = if amp.starts_with("&&") {
         let path = resolve_definition_path(amp, None);
-        builder.upsert_definition(&path, false, Some(file), Some(line), metadata)
+        builder.upsert_definition(
+            &path,
+            false,
+            Some(file),
+            Some(line),
+            metadata,
+            definition_is_exclusive(amp),
+            definition_is_assignee(amp),
+        )
     } else {
         builder.resolve_reference(amp, metadata, file, line)
     };
@@ -782,9 +1218,15 @@ fn push_resolved_amp(
 }
 
 fn resolve_definition_path(amp: &str, parent: Option<&String>) -> String {
-    let raw = amp.trim_start_matches('&');
+    let raw = amp
+        .trim_start_matches('&')
+        .trim_start_matches('^')
+        .trim_end_matches('&');
+    if let Some(assignee) = raw.strip_prefix('@') {
+        return normalize_amp_path(assignee);
+    }
     if raw.starts_with(':') {
-        raw.trim_start_matches(':').trim_matches(':').to_string()
+        normalize_amp_path(raw)
     } else if let Some(parent) = parent {
         let normalized = normalize_amp_path(raw);
         if parent.is_empty() {
@@ -798,14 +1240,155 @@ fn resolve_definition_path(amp: &str, parent: Option<&String>) -> String {
 }
 
 fn is_absolute_definition_path(amp: &str) -> bool {
-    amp.trim_start_matches('&').starts_with(':')
+    let raw = amp.trim_start_matches('&').trim_start_matches('^');
+    raw.starts_with(':') || raw.starts_with('@')
+}
+
+fn definition_is_exclusive(amp: &str) -> bool {
+    amp.trim_start_matches('&').starts_with('^')
+}
+
+fn definition_is_assignee(amp: &str) -> bool {
+    amp.trim_start_matches('&')
+        .trim_start_matches('^')
+        .starts_with('@')
+}
+
+fn definition_is_filesystem(amp: &str) -> bool {
+    amp.starts_with("&&") && amp.ends_with('&') && amp.len() > 3
+}
+
+fn date_from_file_path(path: &Path, root: &Path) -> Option<String> {
+    let mut dates = Vec::new();
+    if let Some(root_name) = root.file_name().and_then(|name| name.to_str())
+        && let Some(date) = parse::date_in_path_component(root_name)
+    {
+        dates.push(date);
+    }
+    let relative = path.strip_prefix(root).unwrap_or(path);
+    for component in relative.components() {
+        if let Some(value) = component.as_os_str().to_str()
+            && let Some(date) = parse::date_in_path_component(value)
+        {
+            dates.push(date);
+        }
+    }
+    dates.into_iter().min()
+}
+
+fn filename_status(stem: &str) -> Option<Status> {
+    let mut chars = stem.chars();
+    let first = chars.next()?;
+    if first.is_lowercase() && chars.any(char::is_uppercase) {
+        Some(Status::Todo)
+    } else if first.is_uppercase() {
+        Some(Status::Done)
+    } else {
+        None
+    }
+}
+
+fn append_filesystem_components(base: &str, base_dir: &Path, directory: &Path) -> String {
+    let mut path = base.to_string();
+    for component in directory
+        .strip_prefix(base_dir)
+        .unwrap_or(directory)
+        .components()
+    {
+        let part = filesystem_amp_part(&component.as_os_str().to_string_lossy());
+        if !part.is_empty() {
+            path.push(':');
+            path.push_str(&part);
+        }
+    }
+    path
+}
+
+fn filesystem_amp_part(value: &str) -> String {
+    let value = value.to_lowercase();
+    if value.chars().all(|ch| ch.is_alphanumeric() || ch == '_') {
+        value
+    } else {
+        format!("`{value}`")
+    }
 }
 
 fn normalize_amp_path(amp: &str) -> String {
     amp.trim_start_matches('&')
+        .trim_start_matches('^')
+        .trim_start_matches('@')
         .trim_start_matches(':')
         .trim_matches(':')
-        .to_string()
+        .to_lowercase()
+}
+
+pub fn amp_path_depth(path: &str) -> usize {
+    amp_path_separator_indices(path).len()
+}
+
+fn amp_path_tail(path: &str) -> &str {
+    amp_path_separator_indices(path)
+        .last()
+        .map(|index| &path[index + 1..])
+        .unwrap_or(path)
+}
+
+fn amp_path_parent(path: &str) -> Option<&str> {
+    amp_path_separator_indices(path)
+        .last()
+        .map(|index| &path[..*index])
+        .filter(|parent| !parent.is_empty())
+}
+
+fn amp_path_separator_indices(path: &str) -> Vec<usize> {
+    let mut quoted = false;
+    path.char_indices()
+        .filter_map(|(index, ch)| {
+            if ch == '`' {
+                quoted = !quoted;
+                None
+            } else if ch == ':' && !quoted {
+                Some(index)
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn amp_path_parts(path: &str) -> Vec<&str> {
+    let separators = amp_path_separator_indices(path);
+    let mut parts = Vec::with_capacity(separators.len() + 1);
+    let mut start = 0;
+    for separator in separators {
+        parts.push(&path[start..separator]);
+        start = separator + 1;
+    }
+    parts.push(&path[start..]);
+    parts
+}
+
+fn amp_path_partial_match(reference: &str, definition: &str) -> bool {
+    let reference = amp_path_parts(reference);
+    let definition = amp_path_parts(definition);
+    if reference.len() < 2 || reference.len() >= definition.len() {
+        return false;
+    }
+    if reference.last() != definition.last() {
+        return false;
+    }
+
+    let mut definition_index = definition.len() - 1;
+    for reference_part in reference[..reference.len() - 1].iter().rev() {
+        let Some(index) = definition[..definition_index]
+            .iter()
+            .rposition(|definition_part| definition_part == reference_part)
+        else {
+            return false;
+        };
+        definition_index = index;
+    }
+    true
 }
 
 #[cfg(test)]
@@ -848,6 +1431,390 @@ mod tests {
     }
 
     #[test]
+    fn resolves_unique_partial_amp_path_back_to_front() {
+        let dir = test_dir("partial-resolution");
+        fs::write(
+            dir.join("notes.md"),
+            "# Release &&:Company:Platform:API:Release\n- [ ] TODO &company:api:release matched\n",
+        )
+        .unwrap();
+
+        let forest = build_forest(&Config::from_roots(vec![dir.clone()])).unwrap();
+        let chore = forest
+            .chores
+            .iter()
+            .find(|chore| chore.text.contains("matched"))
+            .unwrap();
+        assert!(
+            chore
+                .definitions
+                .iter()
+                .any(|id| { forest.definitions[id.0].path == "company:platform:api:release" })
+        );
+        assert!(!forest.issues.iter().any(|issue| {
+            matches!(
+                issue.kind,
+                CheckIssueKind::UnresolvedAmpPath | CheckIssueKind::AmbiguousAmpPath
+            ) && issue.line == Some(2)
+        }));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn reports_ambiguous_partial_amp_path_matches() {
+        let dir = test_dir("partial-resolution-ambiguous");
+        fs::write(
+            dir.join("notes.md"),
+            [
+                "# First &&:area:first:release",
+                "# Second &&:area:second:release",
+                "- [ ] TODO &area:release ambiguous",
+                "",
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        let forest = build_forest(&Config::from_roots(vec![dir.clone()])).unwrap();
+        let issue = forest
+            .issues
+            .iter()
+            .find(|issue| issue.kind == CheckIssueKind::AmbiguousAmpPath && issue.line == Some(3))
+            .unwrap();
+        assert!(issue.message.contains("area:first:release"));
+        assert!(issue.message.contains("area:second:release"));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn partial_amp_path_matching_preserves_part_order_and_quoted_colons() {
+        assert!(amp_path_partial_match(
+            "area:`release: one`:task",
+            "area:middle:`release: one`:detail:task"
+        ));
+        assert!(!amp_path_partial_match(
+            "`release: one`:area:task",
+            "area:middle:`release: one`:detail:task"
+        ));
+    }
+
+    #[test]
+    fn resolves_wikilink_reference_like_colon_amp_path() {
+        let dir = test_dir("wikilink-reference");
+        fs::write(
+            dir.join("notes.md"),
+            "# Area &&:a:b\n- [ ] TODO &[[a/b]] linked\n",
+        )
+        .unwrap();
+
+        let forest = build_forest(&Config::from_roots(vec![dir.clone()])).unwrap();
+        let chore = forest
+            .chores
+            .iter()
+            .find(|chore| chore.text.contains("linked"))
+            .unwrap();
+        assert!(
+            chore
+                .definitions
+                .iter()
+                .any(|id| forest.definitions[id.0].path == "a:b")
+        );
+        assert!(!forest.issues.iter().any(|issue| {
+            issue.kind == CheckIssueKind::UnresolvedAmpPath && issue.line == Some(2)
+        }));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn quoted_amp_path_colons_are_not_structural_separators() {
+        let dir = test_dir("quoted-amp-path");
+        fs::write(
+            dir.join("notes.md"),
+            "# Root &&:root\n## Part &&`part one:two`\n- [ ] TODO &:root:`part one:two` linked\n",
+        )
+        .unwrap();
+
+        let forest = build_forest(&Config::from_roots(vec![dir.clone()])).unwrap();
+        assert!(
+            forest
+                .definitions
+                .iter()
+                .any(|definition| definition.path == "root:`part one:two`")
+        );
+        let chore = forest
+            .chores
+            .iter()
+            .find(|chore| chore.text.contains("linked"))
+            .unwrap();
+        let paths = chore
+            .definitions
+            .iter()
+            .map(|id| forest.definitions[id.0].path.as_str())
+            .collect::<Vec<_>>();
+        assert!(paths.contains(&"root:`part one:two`"));
+        assert!(paths.contains(&"root"));
+        assert!(
+            !forest
+                .definitions
+                .iter()
+                .any(|definition| definition.path == "root:`part one")
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn amp_path_depth_ignores_colons_inside_backticks() {
+        assert_eq!(amp_path_depth("root:`part one:two`:leaf"), 2);
+        assert_eq!(amp_path_tail("root:`part one:two`"), "`part one:two`");
+        assert_eq!(amp_path_parent("root:`part one:two`"), Some("root"));
+    }
+
+    #[test]
+    fn trailing_ampersand_injects_line_amp_paths_into_target_definitions() {
+        let dir = test_dir("inverse-injection");
+        fs::write(
+            dir.join("notes.md"),
+            [
+                "# Alpha &&:alpha &#3",
+                "# Beta &&:beta",
+                "# Middle &&:middle",
+                "# Target &&:target",
+                "# Other &&:other",
+                "&alpha &middle&",
+                "&middle &beta &target& &other&",
+                "- [ ] TODO &target downstream",
+                "",
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        let forest = build_forest(&Config::from_roots(vec![dir.clone()])).unwrap();
+        let paths_for = |name: &str| {
+            let definition = forest
+                .definitions
+                .iter()
+                .find(|definition| definition.path == name)
+                .unwrap();
+            definition
+                .definitions
+                .iter()
+                .map(|id| forest.definitions[id.0].path.as_str())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(paths_for("middle"), vec!["alpha"]);
+        assert_eq!(paths_for("target"), vec!["middle", "beta"]);
+        assert_eq!(paths_for("other"), vec!["middle", "beta"]);
+
+        let downstream = forest
+            .chores
+            .iter()
+            .find(|chore| chore.text.contains("downstream"))
+            .unwrap();
+        let related = downstream
+            .definitions
+            .iter()
+            .map(|id| forest.definitions[id.0].path.as_str())
+            .collect::<Vec<_>>();
+        assert!(related.contains(&"target"));
+        assert!(related.contains(&"middle"));
+        assert!(related.contains(&"beta"));
+        assert!(related.contains(&"alpha"));
+        assert_eq!(computed_chore_order(&forest, downstream).unwrap().value, 3);
+
+        let injection_line = forest.chores.iter().find(|chore| chore.line == 7).unwrap();
+        let injection_related = injection_line
+            .definitions
+            .iter()
+            .map(|id| forest.definitions[id.0].path.as_str())
+            .collect::<Vec<_>>();
+        assert!(!injection_related.contains(&"target"));
+        assert!(
+            !forest
+                .definitions
+                .iter()
+                .any(|definition| definition.path.ends_with('&'))
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn wikilink_trailing_ampersand_is_an_inverse_injection_target() {
+        let dir = test_dir("wikilink-inverse-injection");
+        fs::write(
+            dir.join("notes.md"),
+            "# Alpha &&:alpha\n# Target &&:target:path\n&alpha &[[TARGET/PATH]]&\n- [ ] &target:path downstream\n",
+        )
+        .unwrap();
+
+        let forest = build_forest(&Config::from_roots(vec![dir.clone()])).unwrap();
+        let target = forest
+            .definitions
+            .iter()
+            .find(|definition| definition.path == "target:path")
+            .unwrap();
+        assert_eq!(
+            target
+                .definitions
+                .iter()
+                .map(|id| forest.definitions[id.0].path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["alpha"]
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn amp_paths_and_assignees_are_case_insensitive() {
+        let dir = test_dir("case-insensitive-amp-paths");
+        fs::write(
+            dir.join("notes.md"),
+            [
+                "# Project &&:Project:`Release X`",
+                "# Duplicate &&:PROJECT:`RELEASE X`",
+                "# Person &&@GeErT",
+                "- [ ] &project:`release x` &@GEERT matched",
+                "",
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        let forest = build_forest(&Config::from_roots(vec![dir.clone()])).unwrap();
+        assert_eq!(
+            forest
+                .definitions
+                .iter()
+                .filter(|definition| definition.path == "project:`release x`")
+                .count(),
+            1
+        );
+        assert!(
+            forest
+                .issues
+                .iter()
+                .any(|issue| issue.kind == CheckIssueKind::AmbiguousDefinition)
+        );
+        assert!(
+            !forest
+                .issues
+                .iter()
+                .any(|issue| issue.kind == CheckIssueKind::UnresolvedAssignee)
+        );
+        assert_eq!(
+            forest.chores.last().unwrap().assignee.as_deref(),
+            Some("geert")
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn source_comments_are_scanned_only_when_they_start_with_amp_path() {
+        let dir = test_dir("source-comment-prefix");
+        fs::write(
+            dir.join("notes.rs"),
+            "fn main() {}\n  // TODO &ignored false positive\n  // &accepted TODO and &additional\n",
+        )
+        .unwrap();
+
+        let forest = build_forest(&Config::from_roots(vec![dir.clone()])).unwrap();
+        assert_eq!(forest.chores.len(), 1);
+        assert!(forest.chores[0].text.contains("&accepted"));
+        let paths = forest.chores[0]
+            .definitions
+            .iter()
+            .map(|id| forest.definitions[id.0].path.as_str())
+            .collect::<Vec<_>>();
+        assert!(paths.contains(&"accepted"));
+        assert!(paths.contains(&"additional"));
+        assert!(
+            !forest
+                .definitions
+                .iter()
+                .any(|definition| definition.path == "ignored")
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn trailing_definition_derives_folder_and_file_definitions() {
+        let dir = test_dir("filesystem-definitions");
+        fs::write(dir.join("&.md"), "&&:Knowledge&\n").unwrap();
+        fs::create_dir_all(dir.join("Projects")).unwrap();
+        fs::write(
+            dir.join("Projects").join("My Notes.md"),
+            "- [ ] TODO derived chore\n",
+        )
+        .unwrap();
+        fs::create_dir_all(dir.join("Projects").join("Stopped")).unwrap();
+        fs::write(
+            dir.join("Projects").join("Stopped").join("&.md"),
+            "&&:manual\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("Projects").join("Stopped").join("hidden.md"),
+            "- [ ] TODO stopped chore\n",
+        )
+        .unwrap();
+        fs::create_dir_all(dir.join("Projects").join("Stopped").join("Restarted")).unwrap();
+        fs::write(
+            dir.join("Projects")
+                .join("Stopped")
+                .join("Restarted")
+                .join("&.md"),
+            "&&:Fresh&\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("Projects")
+                .join("Stopped")
+                .join("Restarted")
+                .join("again.md"),
+            "- [ ] TODO restarted chore\n",
+        )
+        .unwrap();
+
+        let forest = build_forest(&Config::from_roots(vec![dir.clone()])).unwrap();
+        let paths = forest
+            .definitions
+            .iter()
+            .map(|definition| definition.path.as_str())
+            .collect::<Vec<_>>();
+        assert!(paths.contains(&"knowledge:projects"));
+        assert!(paths.contains(&"knowledge:projects:`my notes`"));
+        assert!(!paths.contains(&"knowledge:projects:stopped:hidden"));
+        assert!(paths.contains(&"fresh:again"));
+
+        let derived = forest
+            .chores
+            .iter()
+            .find(|chore| chore.text.contains("derived chore"))
+            .unwrap();
+        let related = derived
+            .definitions
+            .iter()
+            .map(|id| forest.definitions[id.0].path.as_str())
+            .collect::<Vec<_>>();
+        assert!(related.contains(&"knowledge:projects:`my notes`"));
+        assert!(related.contains(&"knowledge:projects"));
+        assert!(related.contains(&"knowledge"));
+
+        let restarted = forest
+            .chores
+            .iter()
+            .find(|chore| chore.text.contains("restarted chore"))
+            .unwrap();
+        assert!(
+            restarted
+                .definitions
+                .iter()
+                .any(|id| forest.definitions[id.0].path == "fresh:again")
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn creates_phony_definition_for_unresolved_reference() {
         let dir = test_dir("phony");
         fs::write(dir.join("notes.md"), "- [ ] TODO &missing\n").unwrap();
@@ -879,6 +1846,199 @@ mod tests {
             issue.kind == CheckIssueKind::RelativeDefinitionWithoutParent && issue.line == Some(1)
         }));
 
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn reports_duplicate_definitions_without_one_exclusive_prime() {
+        let dir = test_dir("duplicate-definitions");
+        fs::write(dir.join("a.md"), "# Work &&:work\n").unwrap();
+        fs::write(dir.join("b.md"), "# Work too &&:work\n").unwrap();
+
+        let forest = build_forest(&Config::from_roots(vec![dir.clone()])).unwrap();
+        assert_eq!(
+            forest
+                .issues
+                .iter()
+                .filter(|issue| issue.kind == CheckIssueKind::AmbiguousDefinition)
+                .count(),
+            2
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn exclusive_definition_selects_prime_and_resolves_ambiguity() {
+        let dir = test_dir("exclusive-definition");
+        fs::write(dir.join("a.md"), "# Work &&:work &#1\n").unwrap();
+        fs::write(dir.join("b.md"), "# Work prime &&^:work &#9\n").unwrap();
+
+        let forest = build_forest(&Config::from_roots(vec![dir.clone()])).unwrap();
+        assert!(
+            !forest
+                .issues
+                .iter()
+                .any(|issue| issue.kind == CheckIssueKind::AmbiguousDefinition)
+        );
+        let definition = forest
+            .definitions
+            .iter()
+            .find(|definition| definition.path == "work")
+            .unwrap();
+        assert!(definition.exclusive);
+        assert_eq!(definition.order.map(|order| order.value), Some(9));
+        assert!(
+            forest.files[definition.file.unwrap().0]
+                .path
+                .ends_with("b.md")
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn assignee_definitions_validate_chore_assignments() {
+        let dir = test_dir("assignee-definitions");
+        fs::write(
+            dir.join("notes.md"),
+            "# Alice &&@alice\n- [ ] &@alice assigned\n- [ ] &@bob missing\n",
+        )
+        .unwrap();
+
+        let forest = build_forest(&Config::from_roots(vec![dir.clone()])).unwrap();
+        let alice = forest
+            .definitions
+            .iter()
+            .find(|definition| definition.path == "alice")
+            .unwrap();
+        assert!(alice.is_assignee);
+        assert!(!forest.issues.iter().any(|issue| {
+            issue.kind == CheckIssueKind::UnresolvedAssignee && issue.line == Some(2)
+        }));
+        assert!(forest.issues.iter().any(|issue| {
+            issue.kind == CheckIssueKind::UnresolvedAssignee && issue.line == Some(3)
+        }));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn bare_assignees_resolve_only_against_assignee_definitions() {
+        let dir = test_dir("bare-assignees");
+        fs::write(
+            dir.join("notes.md"),
+            "# Alice &&@alice\n# Topic &&:bob\n- [ ] assigned @Alice\n- [ ] not assigned @bob\n- [ ] unknown @carol\n",
+        )
+        .unwrap();
+
+        let forest = build_forest(&Config::from_roots(vec![dir.clone()])).unwrap();
+        let chore = |text: &str| {
+            forest
+                .chores
+                .iter()
+                .find(|chore| chore.text.contains(text))
+                .unwrap()
+        };
+        assert_eq!(chore("assigned @Alice").assignee.as_deref(), Some("alice"));
+        assert!(chore("not assigned @bob").assignee.is_none());
+        assert!(chore("unknown @carol").assignee.is_none());
+        assert!(!forest.issues.iter().any(|issue| matches!(
+            issue.kind,
+            CheckIssueKind::UnresolvedAssignee | CheckIssueKind::AmbiguousAssignee
+        )));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn dates_in_folder_and_file_names_reach_chores_and_definitions() {
+        let dir = test_dir("filesystem-dates");
+        let dated = dir.join("planning-2026-08-06");
+        fs::create_dir_all(&dated).unwrap();
+        fs::write(
+            dated.join("followup-20260907.md"),
+            "# Project &&:project\n- [ ] dated task\n",
+        )
+        .unwrap();
+
+        let forest = build_forest(&Config::from_roots(vec![dir.clone()])).unwrap();
+        assert_eq!(
+            forest
+                .chores
+                .iter()
+                .find(|chore| chore.text.contains("dated task"))
+                .and_then(|chore| chore.date.as_deref()),
+            Some("20260806")
+        );
+        assert_eq!(
+            forest
+                .definitions
+                .iter()
+                .find(|definition| definition.path == "project")
+                .and_then(|definition| definition.date.as_deref()),
+            Some("20260806")
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn mixed_case_lowercase_filename_creates_file_level_todo() {
+        let dir = test_dir("filename-todo");
+        fs::write(dir.join("&.md"), "&&:knowledge&\n").unwrap();
+        fs::write(dir.join("someTask.md"), "").unwrap();
+        fs::write(dir.join("Some Task.md"), "").unwrap();
+        fs::write(dir.join("lowercase.md"), "").unwrap();
+
+        let forest = build_forest(&Config::from_roots(vec![dir.clone()])).unwrap();
+        let filename_chores = forest
+            .chores
+            .iter()
+            .filter(|chore| chore.text.contains("someTask") || chore.text.contains("Some Task"))
+            .collect::<Vec<_>>();
+        assert_eq!(filename_chores.len(), 2);
+        let todo = filename_chores
+            .iter()
+            .find(|chore| chore.text.contains("someTask"))
+            .unwrap();
+        let done = filename_chores
+            .iter()
+            .find(|chore| chore.text.contains("Some Task"))
+            .unwrap();
+        assert_eq!(todo.text, "- [ ] someTask");
+        assert_eq!(todo.status, Some(Status::Todo));
+        assert!(
+            todo.definitions
+                .iter()
+                .any(|id| { forest.definitions[id.0].path == "knowledge:sometask" })
+        );
+        assert_eq!(done.text, "- [x] Some Task");
+        assert_eq!(done.status, Some(Status::Done));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn filename_status_tracks_case_transition() {
+        assert_eq!(filename_status("someTask"), Some(Status::Todo));
+        assert_eq!(filename_status("aB"), Some(Status::Todo));
+        assert_eq!(filename_status("SomeTask"), Some(Status::Done));
+        assert_eq!(filename_status("Some Task"), Some(Status::Done));
+        assert_eq!(filename_status("some task"), None);
+        assert_eq!(filename_status("2026someTask"), None);
+    }
+
+    #[test]
+    fn empty_amp_paths_are_omitted_and_reported() {
+        let dir = test_dir("empty-amp-path");
+        fs::write(dir.join("notes.md"), "- [ ] keep this chore & &&\n").unwrap();
+
+        let forest = build_forest(&Config::from_roots(vec![dir.clone()])).unwrap();
+        assert_eq!(forest.chores.len(), 1);
+        assert!(forest.definitions.is_empty());
+        let issues = forest
+            .issues
+            .iter()
+            .filter(|issue| issue.kind == CheckIssueKind::EmptyAmpPath)
+            .collect::<Vec<_>>();
+        assert_eq!(issues.len(), 2);
+        assert!(issues.iter().all(|issue| issue.line == Some(1)));
+        assert!(issues.iter().all(|issue| issue.message.contains("omitted")));
         fs::remove_dir_all(dir).unwrap();
     }
 
