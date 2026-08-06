@@ -1,3 +1,4 @@
+pub mod lsp;
 pub mod naft;
 mod parse;
 mod scan;
@@ -119,7 +120,19 @@ pub struct Forest {
     pub files: Vec<SourceFile>,
     pub definitions: Vec<Definition>,
     pub chores: Vec<Chore>,
+    pub amp_occurrences: Vec<AmpOccurrence>,
     pub issues: Vec<CheckIssue>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AmpOccurrence {
+    pub file: FileId,
+    pub line: usize,
+    pub start_column: usize,
+    pub end_column: usize,
+    pub raw: String,
+    pub definition: DefinitionId,
+    pub is_declaration: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -324,6 +337,65 @@ fn build_forest_from_files(files: Vec<SourceFile>) -> Forest {
     let mut builder = ForestBuilder::new(files);
     builder.parse_files();
     builder.finish()
+}
+
+pub fn build_forest_with_overlays(
+    config: &Config,
+    overlays: &HashMap<PathBuf, String>,
+) -> Result<Forest> {
+    let mut files = load_files(config)?;
+    for file in &mut files {
+        let absolute = file
+            .path
+            .canonicalize()
+            .unwrap_or_else(|_| file.path.clone());
+        if let Some(text) = overlays.get(&absolute) {
+            file.bytes = text.as_bytes().to_vec();
+            file.text = text.clone();
+        }
+    }
+    for (path, text) in overlays {
+        if files.iter().any(|file| {
+            file.path
+                .canonicalize()
+                .unwrap_or_else(|_| file.path.clone())
+                == *path
+        }) {
+            continue;
+        }
+        let Some((grove, root)) = config.groves.iter().enumerate().find_map(|(index, grove)| {
+            let root = grove
+                .root
+                .canonicalize()
+                .unwrap_or_else(|_| grove.root.clone());
+            path.starts_with(&root).then_some((index, root))
+        }) else {
+            continue;
+        };
+        let extension = path.extension().and_then(|ext| ext.to_str()).unwrap_or("");
+        let accepted = if config.groves[grove].extensions.is_empty() {
+            matches!(
+                extension,
+                "md" | "c" | "h" | "cc" | "cpp" | "cxx" | "hpp" | "hh" | "rb" | "rs" | "zig"
+            )
+        } else {
+            config.groves[grove]
+                .extensions
+                .iter()
+                .any(|item| item.trim_start_matches('.').eq_ignore_ascii_case(extension))
+        };
+        if accepted {
+            files.push(SourceFile {
+                id: FileId(files.len()),
+                grove,
+                root,
+                path: path.clone(),
+                bytes: text.as_bytes().to_vec(),
+                text: text.clone(),
+            });
+        }
+    }
+    Ok(build_forest_from_files(files))
 }
 
 struct ForestBuilder {
@@ -825,12 +897,78 @@ impl ForestBuilder {
         }
         self.add_filename_chores(&mut chores);
 
+        let amp_occurrences = self.build_amp_occurrences();
         Forest {
             files: self.files,
             definitions: self.definitions,
             chores,
+            amp_occurrences,
             issues: self.issues,
         }
+    }
+
+    fn build_amp_occurrences(&self) -> Vec<AmpOccurrence> {
+        let mut occurrences = Vec::new();
+        for file in &self.files {
+            let is_markdown = file
+                .path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("md"));
+            let mut markdown_state = parse::MarkdownState::default();
+            for (line_index, raw_line) in file.text.lines().enumerate() {
+                let Some(content) = parse::content_line(raw_line, is_markdown, &file.path) else {
+                    continue;
+                };
+                let base = raw_line.find(content.text).unwrap_or(0);
+                let visible;
+                let source = if is_markdown {
+                    let Some(line) =
+                        parse::markdown_visible_line_with_issues(content.text, &mut markdown_state)
+                    else {
+                        continue;
+                    };
+                    visible = line.text;
+                    visible.as_str()
+                } else {
+                    content.text
+                };
+                for (start, end, raw) in amp_tokens(source) {
+                    let metadata = extract_metadata(raw);
+                    let (amp, is_declaration) = if let Some(amp) = metadata.definitions.first() {
+                        (amp.as_str(), true)
+                    } else if let Some(amp) = metadata.references.first() {
+                        (amp.as_str(), false)
+                    } else {
+                        continue;
+                    };
+                    let definition = if is_declaration {
+                        self.definitions.iter().find(|definition| {
+                            definition.file == Some(file.id)
+                                && definition.line == Some(line_index + 1)
+                                && (definition.path == resolve_definition_path(amp, None)
+                                    || definition
+                                        .path
+                                        .ends_with(&format!(":{}", normalize_amp_path(amp))))
+                        })
+                    } else {
+                        resolved_definition(&self.definitions, amp)
+                    };
+                    if let Some(definition) = definition {
+                        occurrences.push(AmpOccurrence {
+                            file: file.id,
+                            line: line_index + 1,
+                            start_column: base + start + 1,
+                            end_column: base + end + 1,
+                            raw: raw.to_string(),
+                            definition: definition.id,
+                            is_declaration,
+                        });
+                    }
+                }
+            }
+        }
+        occurrences
     }
 
     fn add_filename_chores(&mut self, chores: &mut Vec<Chore>) {
@@ -1274,6 +1412,73 @@ fn date_from_file_path(path: &Path, root: &Path) -> Option<String> {
         }
     }
     dates.into_iter().min()
+}
+
+fn amp_tokens(line: &str) -> Vec<(usize, usize, &str)> {
+    let bytes = line.as_bytes();
+    let mut result = Vec::new();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] != b'&' {
+            index += 1;
+            continue;
+        }
+        let start = index;
+        if line[start..].starts_with("&[[")
+            && let Some(close) = line[start + 3..].find("]]")
+        {
+            index = start + 3 + close + 2;
+            if bytes.get(index) == Some(&b'&') {
+                index += 1;
+            }
+            result.push((start, index, &line[start..index]));
+            continue;
+        }
+        index += 1;
+        let mut quoted = false;
+        while index < bytes.len() {
+            let ch = line[index..].chars().next().unwrap();
+            if ch == '`' {
+                quoted = !quoted;
+            } else if !(quoted
+                || ch.is_ascii_alphanumeric()
+                || matches!(ch, '_' | '&' | ':' | '#' | '^' | '@' | '?' | '+'))
+            {
+                break;
+            }
+            index += ch.len_utf8();
+        }
+        result.push((start, index, &line[start..index]));
+    }
+    result
+}
+
+fn resolved_definition<'a>(definitions: &'a [Definition], amp: &str) -> Option<&'a Definition> {
+    let reference = normalize_amp_path(amp.trim_end_matches('&'));
+    definitions
+        .iter()
+        .find(|definition| definition.path == reference)
+        .or_else(|| {
+            let suffix = format!(":{reference}");
+            let matches = definitions
+                .iter()
+                .filter(|definition| {
+                    definition.path.ends_with(&suffix)
+                        || amp_path_tail(&definition.path) == reference
+                })
+                .collect::<Vec<_>>();
+            if matches.len() == 1 {
+                Some(matches[0])
+            } else if matches.is_empty() {
+                let partial = definitions
+                    .iter()
+                    .filter(|definition| amp_path_partial_match(&reference, &definition.path))
+                    .collect::<Vec<_>>();
+                (partial.len() == 1).then(|| partial[0])
+            } else {
+                None
+            }
+        })
 }
 
 fn filename_status(stem: &str) -> Option<Status> {

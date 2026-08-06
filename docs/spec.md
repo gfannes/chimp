@@ -6,6 +6,8 @@ for Markdown and source files.
 ## Groves &&groves
 
 - Global CLI flags must be specified before the command.
+- `chimp lsp [-C PATH...]` runs a stdio LSP server. Stdout contains only framed
+  JSON-RPC messages; optional logging is written to stderr.
 - `-V LEVEL`/`--verbose LEVEL` accepts levels 0 through 4 and defaults to 1:
   0 emits required command output only and suppresses diagnostics; 1 reports
   enough context to identify a failure; 2 may warn about suspicious input
@@ -36,6 +38,18 @@ for Markdown and source files.
   relative Definitions without a higher-level Definition, WBS metadata without a
   same-line Definition, unresolved or ambiguous assignees, duplicate Definition
   declarations, and Markdown parsing issues.
+
+## Language server
+
+- The server synchronizes open documents incrementally using UTF-16 LSP
+  positions and rebuilds the Forest from disk plus unsaved document overlays.
+- It supports completion, Definition and reference navigation, document and
+  workspace symbols, and reload code actions/commands.
+- Prototype-compatible Chore navigation maps declaration to active Chores in
+  the current file, implementation to all active Chores, and type-definition
+  to the first Chore in each sorted file segment.
+- `[lsp] max_array_size` is a positive integer, defaults to 100, and caps
+  workspace-symbol results.
 
 ## Metadata &&metadata
 

@@ -22,6 +22,7 @@ cargo run -- --nocolor -V 1 chores --details -n 5 -C . storage
 cargo run -- export /tmp/chimp-export --strip-amp --status TODO --amp storage:roundtrip --ext md .
 cargo run -- -V 3 naft encode /tmp/grove.naft -u -U .
 cargo run -- naft decode /tmp/grove.naft /tmp/chimp-naft
+cargo run -- lsp
 ```
 
 The initial implementation supports Markdown, C/C++, Ruby, Rust, and Zig files.
@@ -43,6 +44,13 @@ level 4 may report detailed parsing and aggregation activity.
 
 Human-readable command output is Markdown. Reports put enumerations directly
 after their heading or introductory line, without an extra blank line.
+
+`chimp lsp` starts a Language Server Protocol server over stdin/stdout. It
+provides AmpPath completion, Definition and reference navigation, document and
+workspace symbols, Chore navigation, and a reload code action. Open editor
+buffers—including incremental unsaved changes—overlay the configured Groves.
+Use repeated `-C PATH` options to add Groves. Configure the workspace-symbol
+result cap with `[lsp]` and `max_array_size = 100` in `config.toml`.
 
 `export` writes loaded files to a destination outside all Grove roots. By
 default, exported files include Amp metadata exactly as loaded. Use `--strip-amp`

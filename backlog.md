@@ -42,3 +42,4 @@
 - [x] Metadata should also be parsed from folder and filenames: when a date is identified as `YYYYMMDD` or `YYYY-MM-DD` inside the folder of file name, add the corresponding date to this folder/file and distribute it to its leaf nodes.
 - [x] A filename that starts lowercase but contains uppercase letters later should receive the TODO metadata item. Rationale is that denoting a filename as mixed-case initially indicates it is still TODO. When the name is updated later into a full camelcase (with maybe spaces), the file itself Chore is considered DONE.
 - [x] An empty AmpPath must be omitted and reported via `chimp check`
+- [x] Add a `chimp lsp` command with feature parity with the Zig prototype, including live unsaved document support.

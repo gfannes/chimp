@@ -13,6 +13,7 @@ Config
         └── source locations          │
                                       ▼
 Forest ── definitions ─────────── Definition
+       ├─ amp_occurrences ─────── AmpOccurrence
        └─ issues ──────────────── CheckIssue
 ```
 
@@ -60,6 +61,12 @@ from metadata extraction.
 
 An `&.md` file is special: its metadata supplies folder context to other files
 below that folder in the same Grove.
+
+`Forest.amp_occurrences` records every direct, non-metadata AmpPath token that
+resolved during construction. Each occurrence stores its file, one-based line,
+one-based byte-column start and exclusive end, original spelling, resolved
+`DefinitionId`, and whether it is a declaration. The LSP converts these stable
+source ranges to UTF-16 positions for Definition and reference navigation.
 
 A trailing-ampersand Definition in folder metadata also creates a filesystem
 context. Chimp appends the relative folder components and file stem to that

@@ -1,6 +1,7 @@
 use std::fs;
+use std::io::Write;
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[test]
@@ -670,6 +671,50 @@ fn check_reports_empty_amp_paths() {
     assert!(stdout.contains("**EmptyAmpPath**"));
     assert!(stdout.contains("empty AmpPath is not allowed and was omitted"));
     assert!(stdout.contains("Issues: 1"));
+    fs::remove_dir_all(dir).unwrap();
+    fs::remove_dir_all(home).unwrap();
+}
+
+#[test]
+fn lsp_command_runs_framed_initialize_and_shutdown_session() {
+    let dir = test_dir("cli-lsp");
+    let home = test_dir("cli-lsp-home");
+    fs::write(dir.join("notes.md"), "# Alpha &&:alpha\n").unwrap();
+    let messages = [
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+        r#"{"jsonrpc":"2.0","id":2,"method":"shutdown"}"#,
+        r#"{"jsonrpc":"2.0","method":"exit"}"#,
+    ];
+    let input = messages
+        .iter()
+        .map(|body| format!("Content-Length: {}\r\n\r\n{body}", body.len()))
+        .collect::<String>();
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_chimp"))
+        .env("HOME", &home)
+        .arg("lsp")
+        .arg("-C")
+        .arg(&dir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(input.as_bytes())
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.starts_with("Content-Length: "));
+    assert!(stdout.contains("\"positionEncoding\":\"utf-16\""));
+    assert!(stdout.contains("\"id\":2"));
+    assert!(stdout.contains("\"result\":null"));
+    assert!(output.stderr.is_empty());
     fs::remove_dir_all(dir).unwrap();
     fs::remove_dir_all(home).unwrap();
 }

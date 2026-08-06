@@ -272,6 +272,29 @@ fn run() -> Result<()> {
             let summary = export_forest(&forest, destination, &options)?;
             println!("Files written: {}", summary.files_written);
         }
+        "lsp" => {
+            let mut extra_roots = Vec::new();
+            while let Some(arg) = args.next() {
+                match arg.as_str() {
+                    "-C" | "--grove" => {
+                        extra_roots.push(PathBuf::from(args.next().ok_or("-C requires a path")?));
+                    }
+                    "-h" | "--help" => {
+                        println!("chimp lsp\n\nUSAGE:\n  chimp lsp [-C PATH|--grove PATH]\n");
+                        return Ok(());
+                    }
+                    _ => return Err(format!("unexpected argument: {arg}").into()),
+                }
+            }
+            let cli_config = default_cli_config_with_extra(extra_roots)?;
+            chimp::lsp::run(
+                Config::from_groves(cli_config.groves),
+                chimp::lsp::Options {
+                    max_array_size: cli_config.lsp_max_array_size.unwrap_or(100),
+                    verbose,
+                },
+            )?;
+        }
         "naft" => {
             let Some(subcommand) = args.next() else {
                 return Err("naft requires encode or decode".into());
@@ -358,6 +381,7 @@ struct CliConfig {
     groves: Vec<GroveConfig>,
     default_assignee: Option<String>,
     editor: Option<String>,
+    lsp_max_array_size: Option<usize>,
 }
 
 fn default_cli_config_with_extra(extra_roots: Vec<PathBuf>) -> Result<CliConfig> {
@@ -380,7 +404,11 @@ fn read_cli_config_from_default_locations() -> Result<Option<CliConfig>> {
         config.merge(read_cli_config(&path)?);
     }
     config.merge(read_cli_config(Path::new("chimp.toml"))?);
-    if config.groves.is_empty() && config.default_assignee.is_none() && config.editor.is_none() {
+    if config.groves.is_empty()
+        && config.default_assignee.is_none()
+        && config.editor.is_none()
+        && config.lsp_max_array_size.is_none()
+    {
         Ok(None)
     } else {
         Ok(Some(config))
@@ -395,6 +423,9 @@ impl CliConfig {
         }
         if other.editor.is_some() {
             self.editor = other.editor;
+        }
+        if other.lsp_max_array_size.is_some() {
+            self.lsp_max_array_size = other.lsp_max_array_size;
         }
     }
 }
@@ -442,6 +473,7 @@ impl GroveDraft {
 fn parse_config(base: &Path, text: &str) -> Result<CliConfig> {
     let mut config = CliConfig::default();
     let mut current = None::<GroveDraft>;
+    let mut in_lsp = false;
 
     for (index, raw_line) in text.lines().enumerate() {
         let line_number = index + 1;
@@ -457,6 +489,14 @@ fn parse_config(base: &Path, text: &str) -> Result<CliConfig> {
                 line: line_number,
                 ..GroveDraft::default()
             });
+            in_lsp = false;
+            continue;
+        }
+        if line == "[lsp]" {
+            if let Some(draft) = current.take() {
+                config.groves.push(draft.finish(base)?);
+            }
+            in_lsp = true;
             continue;
         }
         if line.starts_with('[') {
@@ -469,7 +509,25 @@ fn parse_config(base: &Path, text: &str) -> Result<CliConfig> {
         let key = key.trim();
         let value = value.trim();
 
-        if let Some(draft) = current.as_mut() {
+        if in_lsp {
+            match key {
+                "max_array_size" => {
+                    let size = value.parse::<usize>().map_err(|_| {
+                        format!("line {line_number}: `max_array_size` must be a positive integer")
+                    })?;
+                    if size == 0 {
+                        return Err(format!(
+                            "line {line_number}: `max_array_size` must be greater than zero"
+                        )
+                        .into());
+                    }
+                    config.lsp_max_array_size = Some(size);
+                }
+                _ => {
+                    return Err(format!("line {line_number}: unknown LSP key `{key}`").into());
+                }
+            }
+        } else if let Some(draft) = current.as_mut() {
             apply_grove_config_value(draft, key, value, line_number)?;
         } else {
             match key {
@@ -643,6 +701,10 @@ fn print_config(config: &CliConfig) {
             .as_deref()
             .map(|editor| format!("`{editor}`"))
             .unwrap_or_else(|| "`$EDITOR` or `nvim`".to_string())
+    );
+    println!(
+        "LSP maximum array size: {}",
+        config.lsp_max_array_size.unwrap_or(100)
     );
     println!("## Groves");
     for (index, grove) in config.groves.iter().enumerate() {
@@ -1328,7 +1390,7 @@ fn order_color(order: u32) -> u8 {
 
 fn print_help() {
     println!(
-        "chimp\n\nUSAGE:\n  chimp [--nocolor] [-V LEVEL|--verbose LEVEL] scan [PATH...]\n  chimp [--nocolor] [-V LEVEL|--verbose LEVEL] config [-C PATH]\n  chimp [--nocolor] [-V LEVEL|--verbose LEVEL] check [-e] [-n COUNT] [-C PATH]\n  chimp [--nocolor] [-V LEVEL|--verbose LEVEL] debug [-e] [-n COUNT] [-C PATH]\n  chimp [--nocolor] [-V LEVEL|--verbose LEVEL] wbs [-e] [-n COUNT] [-C PATH]\n  chimp [--nocolor] [-V LEVEL|--verbose LEVEL] chores [-e] [-d|--details] [-n COUNT] [-C PATH] [--status STATUS] [--assignee NAME|@NAME] [QUERY...]\n  chimp [--nocolor] [-V LEVEL|--verbose LEVEL] export DEST [--include-amp|--strip-amp] [--status STATUS] [--amp TAG] [--ext EXT] [PATH...]\n  chimp [-V LEVEL|--verbose LEVEL] naft encode OUT.naft [-u] [-U] FOLDER...\n  chimp [-V LEVEL|--verbose LEVEL] naft decode IN.naft BASE_FOLDER\n"
+        "chimp\n\nUSAGE:\n  chimp [--nocolor] [-V LEVEL|--verbose LEVEL] scan [PATH...]\n  chimp [--nocolor] [-V LEVEL|--verbose LEVEL] config [-C PATH]\n  chimp [--nocolor] [-V LEVEL|--verbose LEVEL] check [-e] [-n COUNT] [-C PATH]\n  chimp [--nocolor] [-V LEVEL|--verbose LEVEL] debug [-e] [-n COUNT] [-C PATH]\n  chimp [--nocolor] [-V LEVEL|--verbose LEVEL] wbs [-e] [-n COUNT] [-C PATH]\n  chimp [--nocolor] [-V LEVEL|--verbose LEVEL] chores [-e] [-d|--details] [-n COUNT] [-C PATH] [--status STATUS] [--assignee NAME|@NAME] [QUERY...]\n  chimp [--nocolor] [-V LEVEL|--verbose LEVEL] export DEST [--include-amp|--strip-amp] [--status STATUS] [--amp TAG] [--ext EXT] [PATH...]\n  chimp [-V LEVEL|--verbose LEVEL] lsp [-C PATH]\n  chimp [-V LEVEL|--verbose LEVEL] naft encode OUT.naft [-u] [-U] FOLDER...\n  chimp [-V LEVEL|--verbose LEVEL] naft decode IN.naft BASE_FOLDER\n"
     );
 }
 
@@ -1362,6 +1424,17 @@ mod tests {
                 PathBuf::from("/tmp/config/b")
             ]
         );
+    }
+
+    #[test]
+    fn parses_lsp_config() {
+        let config = parse_config(
+            Path::new("/tmp/config"),
+            "root = \"notes\"\n[lsp]\nmax_array_size = 42\n",
+        )
+        .unwrap();
+        assert_eq!(config.lsp_max_array_size, Some(42));
+        assert!(parse_config(Path::new("/tmp/config"), "[lsp]\nmax_array_size = 0\n").is_err());
     }
 
     #[test]
@@ -1565,6 +1638,7 @@ extensions = ["rs"]
                 wbs: Vec::new(),
                 definitions: vec![DefinitionId(0)],
             }],
+            amp_occurrences: Vec::new(),
             issues: Vec::new(),
         }
     }

@@ -16,13 +16,12 @@ benefit outweighs the additional dependency and maintenance cost.
 | Build and package tool | Cargo |
 | Package shape | One library crate and one `chimp` binary |
 | License | MIT |
-| External dependencies | None |
+| External dependencies | `serde`, `serde_json` |
 
-Chimp currently builds entirely on the Rust standard library. `Cargo.lock`
-contains only the `chimp` package. This keeps builds small and reproducible,
-reduces supply-chain exposure, and makes the implementation easy to audit. The
-tradeoff is that Chimp maintains several parsers and platform abstractions that
-established crates could provide more completely.
+Chimp uses Serde only for the JSON-RPC messages exchanged by `chimp lsp`; core
+scanning and metadata parsing remain standard-library based. This keeps the
+protocol implementation small while avoiding a hand-written JSON parser or an
+async LSP framework.
 
 No minimum supported Rust version is declared beyond the compiler support
 implied by Rust edition 2024.
@@ -38,10 +37,11 @@ The package is divided into a small set of modules:
 | `src/scan.rs` | Grove traversal, extension and size filtering, and `.gitignore` handling. |
 | `src/parse.rs` | Metadata extraction, Markdown visibility rules, source-comment recognition, and Amp metadata stripping. |
 | `src/naft.rs` | NAFT syntax, filesystem encoding/decoding, escaping, and Base64 support. |
+| `src/lsp.rs` | Stdio JSON-RPC framing, live document overlays, and LSP feature handlers. |
 
 The application is synchronous and single-process. A scan builds an in-memory
-Forest and commands query or export that Forest. There is no database, cache,
-background service, async runtime, or network protocol. See
+Forest and commands query or export that Forest. The LSP uses the same model
+over stdio without an async runtime. There is no database or background daemon. See
 [the data model](data_model.md) for the objects produced by a scan.
 
 ### Command-line interface
@@ -225,13 +225,13 @@ daemon, editor integration, or continuously refreshed query UI. It should be
 paired with a reconciliation pass because filesystem event delivery varies by
 platform and can be incomplete.
 
-### Editor integration: LSP crates
+### Expanded editor integration: LSP crates
 
-An LSP implementation could provide Definition navigation, references,
-diagnostics, completion for AmpPaths and assignees, and Chore code lenses.
-`tower-lsp` or lower-level `lsp-types` building blocks are possible foundations.
-This direction benefits from structured errors, stable source spans, and an
-incremental index first.
+The current LSP deliberately uses a small local protocol layer. If Chimp later
+adds diagnostics, cancellation, code lenses, or concurrent requests,
+`tower-lsp` or lower-level `lsp-types` could replace it. That trade would add an
+async dependency stack but reduce the amount of protocol surface maintained
+locally.
 
 ### Testing tools
 
@@ -271,7 +271,8 @@ The following sequence minimizes architectural churn:
    service integrations.
 4. Add property tests and fuzzing as the metadata and NAFT grammars expand.
 5. Benchmark before adding parallelism or persistence.
-6. Add an incremental index and file watching before implementing LSP features.
+6. Add an incremental index and file watching if LSP rebuild latency becomes
+   noticeable on large Groves.
 
 The central constraint is source fidelity: future libraries should preserve
 Chimp's deterministic output, exact source locations, original bytes, and
