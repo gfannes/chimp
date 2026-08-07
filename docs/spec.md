@@ -87,7 +87,9 @@ for Markdown and source files.
   uppercase letter creates a synthetic file-level TODO Chore. A stem beginning
   uppercase creates the corresponding DONE Chore. The synthetic Chore inherits
   the file's resolved Definitions and path-derived date, and is rendered as a
-  Markdown checkbox item using the stem without its extension.
+  Markdown checkbox item using the stem without its extension. This applies
+  only when a trailing-`&` Definition has created the file's automatic leaf
+  Definition; stopping that cascade also disables the filename Chore.
 - A Definition ending in `&`, such as `&&:knowledge&`, enables filesystem
   Definition derivation below its location.
 - For each scanned file under a cascading Definition, nested folder names and

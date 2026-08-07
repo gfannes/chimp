@@ -84,11 +84,12 @@ month is shorter, the day is clamped to its final day.
 Valid `YYYYMMDD` and `YYYY-MM-DD` dates embedded in folder or file names are
 also inherited by their contained Chores and Definitions. When several path
 components contain dates, the earliest date is retained.
-Chimp also treats a filename stem as a file-level Chore when its casing carries
-workflow state. A stem that starts lowercase and contains a later uppercase
-letter, such as `draftProposal.md`, creates a TODO item. Capitalizing the first
-letter (`DraftProposal.md`, with spaces also allowed) changes that item to DONE,
-so it disappears from the normal `chores` report.
+Inside a subtree where a trailing-`&` Definition enables automatic filesystem
+Definitions, Chimp also treats filename casing as file-level Chore state. A
+stem that starts lowercase and contains a later uppercase letter, such as
+`draftProposal.md`, creates a TODO item. Capitalizing the first letter
+(`DraftProposal.md`, with spaces also allowed) changes that item to DONE. Files
+outside such a cascade, or below a Definition that stops it, are unaffected.
 
 A trailing ampersand reverses an AmpPath relationship. On a line such as
 `&urgent &release&`, `release` is not attached to that line's Chore; instead,

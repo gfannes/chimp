@@ -206,7 +206,9 @@ Additionally, filename casing can create a synthetic file-level Chore. A stem
 that begins lowercase and has an uppercase letter later is TODO; a stem that
 begins uppercase is DONE. These Chores use source position 1:1, Markdown task
 text derived from the extensionless stem, and the file's Definition and date
-context. Stems matching neither pattern create no file-level Chore.
+context. They are created only for files with a filesystem-derived leaf
+Definition from an active trailing-`&` cascade. Stems matching neither pattern,
+files outside a cascade, and files below a cascade stop create no such Chore.
 
 | Field | Type | Meaning |
 |---|---|---|

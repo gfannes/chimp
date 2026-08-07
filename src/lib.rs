@@ -974,6 +974,11 @@ impl ForestBuilder {
     fn add_filename_chores(&mut self, chores: &mut Vec<Chore>) {
         let files = self.files.clone();
         for file in files {
+            let Some(filesystem_definition) =
+                self.filesystem_definition_by_file.get(&file.id).copied()
+            else {
+                continue;
+            };
             let Some(stem) = file.path.file_stem().and_then(|stem| stem.to_str()) else {
                 continue;
             };
@@ -983,10 +988,8 @@ impl ForestBuilder {
 
             let mut ids = Vec::new();
             let mut seen = HashSet::new();
-            if let Some(id) = self.filesystem_definition_by_file.get(&file.id).copied()
-                && seen.insert(id)
-            {
-                ids.push(id);
+            if seen.insert(filesystem_definition) {
+                ids.push(filesystem_definition);
             }
             let inherited_metadata = Metadata::default();
             let mut inherited_amp_paths = self.folder_context(file.id);
@@ -2226,6 +2229,37 @@ mod tests {
         assert_eq!(filename_status("Some Task"), Some(Status::Done));
         assert_eq!(filename_status("some task"), None);
         assert_eq!(filename_status("2026someTask"), None);
+    }
+
+    #[test]
+    fn filename_status_creates_chores_only_inside_filesystem_definition_cascades() {
+        let dir = test_dir("filename-todo-scope");
+        fs::write(dir.join("outsideTask.md"), "").unwrap();
+        fs::create_dir_all(dir.join("enabled")).unwrap();
+        fs::write(dir.join("enabled").join("&.md"), "&&:enabled&\n").unwrap();
+        fs::write(dir.join("enabled").join("insideTask.md"), "").unwrap();
+        fs::create_dir_all(dir.join("enabled").join("stopped")).unwrap();
+        fs::write(
+            dir.join("enabled").join("stopped").join("&.md"),
+            "&&:stopped\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("enabled").join("stopped").join("stoppedTask.md"),
+            "",
+        )
+        .unwrap();
+
+        let forest = build_forest(&Config::from_roots(vec![dir.clone()])).unwrap();
+        let filenames = forest
+            .chores
+            .iter()
+            .map(|chore| chore.text.as_str())
+            .collect::<Vec<_>>();
+        assert!(filenames.contains(&"- [ ] insideTask"));
+        assert!(!filenames.contains(&"- [ ] outsideTask"));
+        assert!(!filenames.contains(&"- [ ] stoppedTask"));
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

@@ -41,5 +41,6 @@
 - [x] When `@name` is found without a leading `&` it can still be interpreted as an assignee if 'name' matches with a Definition with the extra assignee flag. Do not report resolve issues via `chimp check` on this.
 - [x] Metadata should also be parsed from folder and filenames: when a date is identified as `YYYYMMDD` or `YYYY-MM-DD` inside the folder of file name, add the corresponding date to this folder/file and distribute it to its leaf nodes.
 - [x] A filename that starts lowercase but contains uppercase letters later should receive the TODO metadata item. Rationale is that denoting a filename as mixed-case initially indicates it is still TODO. When the name is updated later into a full camelcase (with maybe spaces), the file itself Chore is considered DONE.
+	- [x] This should only happen in a part of the tree that has the automatic Definition creation based on folder/filename enabled with the trailing `&`; there are too many false positives when this is enabled always.
 - [x] An empty AmpPath must be omitted and reported via `chimp check`
-- [x] Add a `chimp lsp` command with feature parity with the Zig prototype, including live unsaved document support.
+- [x] In `src_1` you can find the implementation of a early prototype implemented in Zig. This prototype also support an LSP mode, see `src_1/app/lsp.zig` and some support LSP func in `src_1/rubr.zig`. Can you add a new `chimp lsp` command that supports the same?
