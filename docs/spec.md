@@ -13,8 +13,11 @@ for Markdown and source files.
   enough context to identify a failure; 2 may warn about suspicious input
   without significant extra work; 3 reports every processed folder and file;
   and 4 may emit detailed parsing and aggregation activity.
+- `-c FILE`/`--config FILE` selects the config file.
 - Human-readable output is valid Markdown. An enumeration follows its heading
   or introduction directly, without an intervening blank line.
+- `chimp chores -o FILE` and `chimp wbs -o FILE` write results to `.naft`,
+  `.md`, or `.markdown` files based on the destination extension.
 - `chimp config` displays the effective merged configuration, including the
   default assignee and resolved Grove paths and scan settings.
 - Invalid configuration is rejected with the config filename and source line.

@@ -41,6 +41,8 @@ suppresses all optional diagnostics, including errors. Level 1 reports enough
 context to identify failures. Level 2 can report suspicious input without an
 expensive analysis pass. Level 3 reports every folder and file processed, and
 level 4 may report detailed parsing and aggregation activity.
+`-c FILE` or `--config FILE` selects the config file; when omitted, Chimp reads
+`~/.config/chimp/config.toml` and `chimp.toml`.
 
 Human-readable command output is Markdown. Reports put enumerations directly
 after their heading or introductory line, without an extra blank line.
@@ -72,8 +74,11 @@ scanner total (file discovery and reading), parsing and validation, relationship
 filtering and sorting, output, and the complete command to stderr. The scanner
 breakdown includes directory traversal, `.gitignore` handling, entry
 enumeration, sorting, metadata checks, file reads, UTF-8 conversion, other scanner work,
-and file/byte counts. These sub-phases reconcile to the scanner total. Config
-can specify `default_assignee`; unassigned Chores match
+and file/byte counts. These sub-phases reconcile to the scanner total. Use
+`-o FILE` to write chores to a file instead of stdout. The extension selects
+the format: `.naft` writes structured NAFT for end-to-end tests, while `.md`
+and `.markdown` write Markdown. Config can specify
+`default_assignee`; unassigned Chores match
 that assignee. Multiple assignee filters such as `@geert @alice` match either
 assignee. An exclusive assignee such as `&^@geert` clears assignees inherited
 from broader scopes; narrower scopes continue from `geert`. DONE Chores and

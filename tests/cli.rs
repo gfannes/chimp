@@ -111,6 +111,141 @@ fn chores_text_prefix_filters_only_raw_chore_text() {
 }
 
 #[test]
+fn chores_can_write_naft_output() {
+    let dir = test_dir("cli-chores-naft-output");
+    let home = test_dir("cli-chores-naft-output-home");
+    let output_path = dir.join("chores.naft");
+    fs::write(
+        dir.join("notes.md"),
+        [
+            "# Work &&:work &#7 &@geert",
+            "- [ ] TODO &work visible (balanced)",
+            "- [x] DONE &work hidden-done",
+            "",
+        ]
+        .join("\n"),
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_chimp"))
+        .env("HOME", &home)
+        .arg("chores")
+        .arg("-C")
+        .arg(&dir)
+        .arg("-o")
+        .arg(&output_path)
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    assert!(String::from_utf8(output.stdout).unwrap().is_empty());
+    let naft = fs::read_to_string(&output_path).unwrap();
+    assert!(naft.contains("[Chores](count:1){"));
+    assert!(naft.contains("[Chore](text:- [ ] TODO &work visible (balanced)){"));
+    assert!(naft.contains("[Metadata]"));
+    assert!(naft.contains("(status:TODO)"));
+    assert!(naft.contains("(order:7)"));
+    assert!(naft.contains("(assignee:geert)"));
+    assert!(naft.contains("[Definition](path:work)"));
+    assert!(!naft.contains("hidden-done"));
+
+    fs::remove_dir_all(dir).unwrap();
+    fs::remove_dir_all(home).unwrap();
+}
+
+#[test]
+fn chores_can_write_markdown_output() {
+    let dir = test_dir("cli-chores-markdown-output");
+    let home = test_dir("cli-chores-markdown-output-home");
+    let output_path = dir.join("chores.md");
+    fs::write(dir.join("notes.md"), "- [!] BLOCKED &ops blocked item\n").unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_chimp"))
+        .env("HOME", &home)
+        .arg("--nocolor")
+        .arg("chores")
+        .arg("-C")
+        .arg(&dir)
+        .arg("-d")
+        .arg("-o")
+        .arg(&output_path)
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    assert!(String::from_utf8(output.stdout).unwrap().is_empty());
+    let markdown = fs::read_to_string(&output_path).unwrap();
+    assert!(markdown.starts_with("# Chores\n"));
+    assert!(markdown.contains("## `"));
+    assert!(markdown.contains("- [!] BLOCKED &ops blocked item  [1:1 order=- status=BLOCKED"));
+
+    fs::remove_dir_all(dir).unwrap();
+    fs::remove_dir_all(home).unwrap();
+}
+
+#[test]
+fn chores_rejects_unknown_output_extension() {
+    let dir = test_dir("cli-chores-bad-output");
+    let home = test_dir("cli-chores-bad-output-home");
+    fs::write(dir.join("notes.md"), "- [ ] TODO &task\n").unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_chimp"))
+        .env("HOME", &home)
+        .arg("chores")
+        .arg("-C")
+        .arg(&dir)
+        .arg("-o")
+        .arg(dir.join("chores.txt"))
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("unsupported output format"));
+
+    fs::remove_dir_all(dir).unwrap();
+    fs::remove_dir_all(home).unwrap();
+}
+
+#[test]
+fn wbs_can_write_naft_output() {
+    let dir = test_dir("cli-wbs-naft-output");
+    let home = test_dir("cli-wbs-naft-output-home");
+    let output_path = dir.join("wbs.naft");
+    fs::write(
+        dir.join("notes.md"),
+        [
+            "- [ ] TODO &?project scoped work",
+            "- [ ] TODO loose work",
+            "",
+        ]
+        .join("\n"),
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_chimp"))
+        .env("HOME", &home)
+        .arg("wbs")
+        .arg("-C")
+        .arg(&dir)
+        .arg("-o")
+        .arg(&output_path)
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    assert!(String::from_utf8(output.stdout).unwrap().is_empty());
+    let naft = fs::read_to_string(&output_path).unwrap();
+    assert!(naft.contains("[Chores](count:1){"));
+    assert!(naft.contains("[Metadata]"));
+    assert!(naft.contains("scoped work"));
+    assert!(naft.contains("(wbs:project)"));
+    assert!(!naft.contains("loose work"));
+
+    fs::remove_dir_all(dir).unwrap();
+    fs::remove_dir_all(home).unwrap();
+}
+
+#[test]
 fn chores_report_only_active_statuses() {
     let dir = test_dir("cli-chores-status");
     let home = test_dir("cli-chores-status-home");
@@ -442,6 +577,39 @@ fn config_reports_config_toml_parse_errors_with_location() {
     assert!(stderr.contains("line 3"));
     assert!(stderr.contains("max_filesize"));
     fs::remove_dir_all(dir).unwrap();
+    fs::remove_dir_all(home).unwrap();
+}
+
+#[test]
+fn custom_config_file_selects_groves() {
+    let dir = test_dir("cli-config-custom");
+    let configured = test_dir("cli-config-custom-source");
+    let home = test_dir("cli-config-custom-home");
+    fs::write(
+        dir.join("custom.toml"),
+        format!(r#"root = "{}""#, configured.display()),
+    )
+    .unwrap();
+    fs::write(configured.join("notes.md"), "- [ ] TODO &configured\n").unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_chimp"))
+        .current_dir(&dir)
+        .env("HOME", &home)
+        .arg("--nocolor")
+        .arg("-c")
+        .arg("custom.toml")
+        .arg("chores")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert!(
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .contains("configured")
+    );
+
+    fs::remove_dir_all(dir).unwrap();
+    fs::remove_dir_all(configured).unwrap();
     fs::remove_dir_all(home).unwrap();
 }
 

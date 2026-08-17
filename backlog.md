@@ -44,3 +44,5 @@
 	- [x] This should only happen in a part of the tree that has the automatic Definition creation based on folder/filename enabled with the trailing `&`; there are too many false positives when this is enabled always.
 - [x] An empty AmpPath must be omitted and reported via `chimp check`
 - [x] In `src_1` you can find the implementation of a early prototype implemented in Zig. This prototype also support an LSP mode, see `src_1/app/lsp.zig` and some support LSP func in `src_1/rubr.zig`. Can you add a new `chimp lsp` command that supports the same?
+- [x] When the `-c FILENAME` is specified, that filename should be used to load the configuration. When unspecified, use `~/.config/chimp/config.toml` and `chimp.toml`.
+- [x] Support naft output to a file for the different chimp commands. This structured naft output should be easier to use in end-to-end tests than the current human-readable output. When the `-o FILENAME` is specified, take a look at the extension to determine the output format. Other formats that can be added as well is Markdown.

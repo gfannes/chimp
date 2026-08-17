@@ -9,6 +9,7 @@ use chimp::{
     CheckIssue, Chore, ComputedOrder, Config, ExportOptions, Forest, GroveConfig, OrderMetadata,
     Status, amp_path_depth, build_forest_with_reporter_without_occurrences,
     build_forest_with_reporter_without_occurrences_measured, computed_chore_order, export_forest,
+    naft,
 };
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -28,6 +29,7 @@ fn run() -> Result<()> {
     let mut args = std::env::args().skip(1);
     let mut color = true;
     let mut verbose = 1u8;
+    let mut config_path = None;
     let mut command = None;
     while let Some(arg) = args.next() {
         if arg == "--nocolor" {
@@ -36,6 +38,8 @@ fn run() -> Result<()> {
             let value = args.next().ok_or("-V requires a level")?;
             verbose = parse_verbose_level(&value)?;
             VERBOSITY.store(verbose, Ordering::Relaxed);
+        } else if arg == "-c" || arg == "--config" {
+            config_path = Some(PathBuf::from(args.next().ok_or("-c requires a filename")?));
         } else {
             command = Some(arg);
             break;
@@ -48,7 +52,7 @@ fn run() -> Result<()> {
 
     match command.as_str() {
         "scan" => {
-            let config = Config::from_groves(parse_path_groves(args)?);
+            let config = Config::from_groves(parse_path_groves(args, config_path.as_deref())?);
             let (forest, _) = build_cli_forest(&config, verbose, false, false)?;
             println!(
                 "Files: {}; Definitions: {}; Chores: {}",
@@ -67,6 +71,7 @@ fn run() -> Result<()> {
             let mut limit = None;
             let mut edit = false;
             let mut measure = false;
+            let mut output = None;
 
             while let Some(arg) = args.next() {
                 match arg.as_str() {
@@ -95,6 +100,9 @@ fn run() -> Result<()> {
                         let value = args.next().ok_or("-n requires a count")?;
                         limit = Some(parse_count(&value)?);
                     }
+                    "-o" | "--output" => {
+                        output = Some(PathBuf::from(args.next().ok_or("-o requires a filename")?));
+                    }
                     _ if arg.starts_with('-') => {
                         return Err(format!("unexpected argument: {arg}").into());
                     }
@@ -106,7 +114,7 @@ fn run() -> Result<()> {
             }
 
             let started = Instant::now();
-            let cli_config = default_cli_config_with_extra(extra_roots)?;
+            let cli_config = default_cli_config_with_extra(extra_roots, config_path.as_deref())?;
             let config_duration = started.elapsed();
             let (forest, build_measurements) = build_cli_forest(
                 &Config::from_groves(cli_config.groves.clone()),
@@ -115,19 +123,45 @@ fn run() -> Result<()> {
                 measure,
             )?;
             let mut query_measurements = ChoreMeasurements::default();
-            let locations = print_chore_search_results(
+            let chores = matching_chore_results(
                 &forest,
-                status_filter,
-                &assignee_filters,
-                &query_terms,
-                color,
-                details,
                 limit,
-                cli_config.default_assignee.as_deref(),
+                |forest, chore| {
+                    chore_matches(
+                        forest,
+                        chore,
+                        status_filter,
+                        &assignee_filters,
+                        &query_terms,
+                        cli_config.default_assignee.as_deref(),
+                    )
+                },
                 measure.then_some(&mut query_measurements),
             );
-            if edit {
-                open_editor_locations(cli_config.editor.as_deref(), &locations, limit)?;
+            if let Some(output) = output.as_deref() {
+                let started = measure.then(Instant::now);
+                write_chore_results(
+                    &forest,
+                    &chores,
+                    details,
+                    cli_config.default_assignee.as_deref(),
+                    output,
+                )?;
+                if let Some(started) = started {
+                    query_measurements.output = started.elapsed();
+                }
+            } else {
+                let locations = print_chore_results(
+                    &forest,
+                    color,
+                    details,
+                    cli_config.default_assignee.as_deref(),
+                    &chores,
+                    measure.then_some(&mut query_measurements),
+                );
+                if edit {
+                    open_editor_locations(cli_config.editor.as_deref(), &locations, limit)?;
+                }
             }
             if measure {
                 let build = build_measurements.expect("measurements requested");
@@ -166,6 +200,7 @@ fn run() -> Result<()> {
             let mut extra_roots = Vec::new();
             let mut edit = false;
             let mut limit = None;
+            let mut output = None;
             while let Some(arg) = args.next() {
                 match arg.as_str() {
                     "-C" | "--grove" => {
@@ -175,22 +210,35 @@ fn run() -> Result<()> {
                     "-n" | "--limit" => {
                         limit = Some(parse_count(&args.next().ok_or("-n requires a count")?)?);
                     }
+                    "-o" | "--output" => {
+                        output = Some(PathBuf::from(args.next().ok_or("-o requires a filename")?));
+                    }
                     _ if arg.starts_with('-') => {
                         return Err(format!("unexpected argument: {arg}").into());
                     }
                     _ => extra_roots.push(PathBuf::from(arg)),
                 }
             }
-            let cli_config = default_cli_config_with_extra(extra_roots)?;
+            let cli_config = default_cli_config_with_extra(extra_roots, config_path.as_deref())?;
             let (forest, _) = build_cli_forest(
                 &Config::from_groves(cli_config.groves.clone()),
                 verbose,
                 false,
                 false,
             )?;
-            let locations = print_wbs_results(&forest, color);
-            if edit {
-                open_editor_locations(cli_config.editor.as_deref(), &locations, limit)?;
+            let chores = matching_chore_results(
+                &forest,
+                None,
+                |forest, chore| chore_has_wbs(forest, chore),
+                None,
+            );
+            if let Some(output) = output.as_deref() {
+                write_chore_results(&forest, &chores, false, None, output)?;
+            } else {
+                let locations = print_chore_results(&forest, color, false, None, &chores, None);
+                if edit {
+                    open_editor_locations(cli_config.editor.as_deref(), &locations, limit)?;
+                }
             }
         }
         "config" => {
@@ -206,7 +254,10 @@ fn run() -> Result<()> {
                     _ => extra_roots.push(PathBuf::from(arg)),
                 }
             }
-            print_config(&default_cli_config_with_extra(extra_roots)?);
+            print_config(&default_cli_config_with_extra(
+                extra_roots,
+                config_path.as_deref(),
+            )?);
         }
         "check" => {
             let mut extra_roots = Vec::new();
@@ -227,7 +278,7 @@ fn run() -> Result<()> {
                     _ => extra_roots.push(PathBuf::from(arg)),
                 }
             }
-            let cli_config = default_cli_config_with_extra(extra_roots)?;
+            let cli_config = default_cli_config_with_extra(extra_roots, config_path.as_deref())?;
             let (forest, _) = build_cli_forest(
                 &Config::from_groves(cli_config.groves.clone()),
                 verbose,
@@ -258,7 +309,7 @@ fn run() -> Result<()> {
                     _ => extra_roots.push(PathBuf::from(arg)),
                 }
             }
-            let cli_config = default_cli_config_with_extra(extra_roots)?;
+            let cli_config = default_cli_config_with_extra(extra_roots, config_path.as_deref())?;
             let (forest, _) = build_cli_forest(
                 &Config::from_groves(cli_config.groves.clone()),
                 verbose,
@@ -312,7 +363,7 @@ fn run() -> Result<()> {
 
             let destination = destination.ok_or("export requires a destination folder")?;
             let (forest, _) = build_cli_forest(
-                &Config::from_groves(default_groves(roots)?),
+                &Config::from_groves(default_groves(roots, config_path.as_deref())?),
                 verbose,
                 false,
                 false,
@@ -334,7 +385,7 @@ fn run() -> Result<()> {
                     _ => return Err(format!("unexpected argument: {arg}").into()),
                 }
             }
-            let cli_config = default_cli_config_with_extra(extra_roots)?;
+            let cli_config = default_cli_config_with_extra(extra_roots, config_path.as_deref())?;
             chimp::lsp::run(
                 Config::from_groves(cli_config.groves),
                 chimp::lsp::Options {
@@ -399,7 +450,10 @@ fn run() -> Result<()> {
     Ok(())
 }
 
-fn parse_path_groves(args: impl Iterator<Item = String>) -> Result<Vec<GroveConfig>> {
+fn parse_path_groves(
+    args: impl Iterator<Item = String>,
+    config_path: Option<&Path>,
+) -> Result<Vec<GroveConfig>> {
     let mut roots = Vec::new();
     for arg in args {
         if arg.starts_with('-') {
@@ -407,21 +461,23 @@ fn parse_path_groves(args: impl Iterator<Item = String>) -> Result<Vec<GroveConf
         }
         roots.push(PathBuf::from(arg));
     }
-    default_groves(roots)
+    default_groves(roots, config_path)
 }
 
-fn default_groves(roots: Vec<PathBuf>) -> Result<Vec<GroveConfig>> {
+fn default_groves(roots: Vec<PathBuf>, config_path: Option<&Path>) -> Result<Vec<GroveConfig>> {
     if !roots.is_empty() {
         return Ok(roots.into_iter().map(GroveConfig::from_root).collect());
     }
-    if let Some(config_groves) = read_config_groves_from_default_locations()? {
+    if let Some(config_groves) = read_config_groves_from_default_locations(config_path)? {
         return Ok(config_groves);
     }
     Ok(vec![GroveConfig::from_root(std::env::current_dir()?)])
 }
 
-fn read_config_groves_from_default_locations() -> Result<Option<Vec<GroveConfig>>> {
-    Ok(read_cli_config_from_default_locations()?.map(|config| config.groves))
+fn read_config_groves_from_default_locations(
+    config_path: Option<&Path>,
+) -> Result<Option<Vec<GroveConfig>>> {
+    Ok(read_cli_config_from_default_locations(config_path)?.map(|config| config.groves))
 }
 
 #[derive(Debug, Clone, Default)]
@@ -432,8 +488,11 @@ struct CliConfig {
     lsp_max_array_size: Option<usize>,
 }
 
-fn default_cli_config_with_extra(extra_roots: Vec<PathBuf>) -> Result<CliConfig> {
-    let mut config = read_cli_config_from_default_locations()?.unwrap_or_default();
+fn default_cli_config_with_extra(
+    extra_roots: Vec<PathBuf>,
+    config_path: Option<&Path>,
+) -> Result<CliConfig> {
+    let mut config = read_cli_config_from_default_locations(config_path)?.unwrap_or_default();
     config
         .groves
         .extend(extra_roots.into_iter().map(GroveConfig::from_root));
@@ -445,13 +504,17 @@ fn default_cli_config_with_extra(extra_roots: Vec<PathBuf>) -> Result<CliConfig>
     Ok(config)
 }
 
-fn read_cli_config_from_default_locations() -> Result<Option<CliConfig>> {
+fn read_cli_config_from_default_locations(config_path: Option<&Path>) -> Result<Option<CliConfig>> {
     let mut config = CliConfig::default();
-    if let Some(home) = std::env::var_os("HOME") {
+    if let Some(path) = config_path {
+        config.merge(read_cli_config(path)?);
+    } else if let Some(home) = std::env::var_os("HOME") {
         let path = PathBuf::from(home).join(".config/chimp/config.toml");
         config.merge(read_cli_config(&path)?);
     }
-    config.merge(read_cli_config(Path::new("chimp.toml"))?);
+    if config_path.is_none() {
+        config.merge(read_cli_config(Path::new("chimp.toml"))?);
+    }
     if config.groves.is_empty()
         && config.default_assignee.is_none()
         && config.editor.is_none()
@@ -1203,65 +1266,18 @@ fn civil_date_from_unix_days(days: i64) -> (i64, u32, u32) {
     (year, month as u32, day as u32)
 }
 
-fn print_wbs_results(forest: &Forest, color: bool) -> Vec<FileLocation> {
-    print_chore_results(
-        forest,
-        color,
-        false,
-        None,
-        None,
-        |forest, chore| chore_has_wbs(forest, chore),
-        None,
-    )
-}
-
 #[derive(Debug, Default)]
 struct ChoreMeasurements {
     filter_sort: Duration,
     output: Duration,
 }
 
-#[allow(clippy::too_many_arguments)]
-fn print_chore_search_results(
-    forest: &Forest,
-    status_filter: Option<Status>,
-    assignee_filters: &[String],
-    query_terms: &[String],
-    color: bool,
-    details: bool,
+fn matching_chore_results<'a>(
+    forest: &'a Forest,
     limit: Option<usize>,
-    default_assignee: Option<&str>,
-    measurements: Option<&mut ChoreMeasurements>,
-) -> Vec<FileLocation> {
-    print_chore_results(
-        forest,
-        color,
-        details,
-        limit,
-        default_assignee,
-        |forest, chore| {
-            chore_matches(
-                forest,
-                chore,
-                status_filter,
-                assignee_filters,
-                query_terms,
-                default_assignee,
-            )
-        },
-        measurements,
-    )
-}
-
-fn print_chore_results(
-    forest: &Forest,
-    color: bool,
-    details: bool,
-    limit: Option<usize>,
-    default_assignee: Option<&str>,
     matches: impl Fn(&Forest, &Chore) -> bool,
     mut measurements: Option<&mut ChoreMeasurements>,
-) -> Vec<FileLocation> {
+) -> Vec<&'a Chore> {
     let started = measurements.as_ref().map(|_| Instant::now());
     let mut chores = forest
         .chores
@@ -1282,15 +1298,25 @@ fn print_chore_results(
     if let (Some(measurements), Some(started)) = (measurements.as_deref_mut(), started) {
         measurements.filter_sort = started.elapsed();
     }
+    if let Some(limit) = limit {
+        chores.truncate(limit);
+    }
+    chores
+}
 
+fn print_chore_results(
+    forest: &Forest,
+    color: bool,
+    details: bool,
+    default_assignee: Option<&str>,
+    chores: &[&Chore],
+    measurements: Option<&mut ChoreMeasurements>,
+) -> Vec<FileLocation> {
     let started = measurements.as_ref().map(|_| Instant::now());
     let mut current_file = None;
     let mut current_order = None;
     let mut locations = Vec::new();
-    for (printed, chore) in chores.into_iter().enumerate() {
-        if limit.is_some_and(|limit| printed >= limit) {
-            break;
-        }
+    for chore in chores {
         let order = chore_order(forest, chore);
         if current_file != Some(chore.file) {
             current_file = Some(chore.file);
@@ -1359,6 +1385,185 @@ fn is_markdown_enumeration(line: &str) -> bool {
         || trimmed.split_once(". ").is_some_and(|(number, _)| {
             !number.is_empty() && number.chars().all(|ch| ch.is_ascii_digit())
         })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutputFormat {
+    Naft,
+    Markdown,
+}
+
+fn write_chore_results(
+    forest: &Forest,
+    chores: &[&Chore],
+    details: bool,
+    default_assignee: Option<&str>,
+    output: &Path,
+) -> Result<()> {
+    let content = match output_format(output)? {
+        OutputFormat::Naft => render_chore_results_naft(forest, chores, default_assignee),
+        OutputFormat::Markdown => {
+            render_chore_results_markdown(forest, chores, details, default_assignee)
+        }
+    };
+    fs::write(output, content)?;
+    Ok(())
+}
+
+fn output_format(path: &Path) -> Result<OutputFormat> {
+    match path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("naft") => Ok(OutputFormat::Naft),
+        Some("md") | Some("markdown") => Ok(OutputFormat::Markdown),
+        _ => Err(format!(
+            "unsupported output format for {}; expected .naft, .md, or .markdown",
+            path.display()
+        )
+        .into()),
+    }
+}
+
+fn render_chore_results_naft(
+    forest: &Forest,
+    chores: &[&Chore],
+    default_assignee: Option<&str>,
+) -> String {
+    let children = chores
+        .iter()
+        .map(|chore| {
+            let order = chore_order(forest, chore);
+            let mut metadata = vec![
+                (
+                    "file".to_string(),
+                    forest.files[chore.file.0].path.display().to_string(),
+                ),
+                ("line".to_string(), chore.line.to_string()),
+                ("column".to_string(), chore.column.to_string()),
+                ("status".to_string(), status_label(chore.status).to_string()),
+                (
+                    "assignee".to_string(),
+                    assignee_label(forest, chore, default_assignee),
+                ),
+            ];
+            if let Some(order) = order {
+                metadata.push(("order".to_string(), order.value.to_string()));
+                if order.exclusive {
+                    metadata.push(("order_exclusive".to_string(), "true".to_string()));
+                }
+                if order.conflict {
+                    metadata.push(("order_conflict".to_string(), "true".to_string()));
+                }
+            }
+            if let Some(date) = &chore.date {
+                metadata.push(("date".to_string(), date.clone()));
+            }
+            if !chore.wbs.is_empty() {
+                metadata.push(("wbs".to_string(), chore.wbs.join(",")));
+            }
+
+            let mut children = vec![naft::Node {
+                tag: "Metadata".to_string(),
+                options: metadata,
+                children: Vec::new(),
+            }];
+            children.extend(chore.definitions.iter().map(|id| {
+                let definition = &forest.definitions[id.0];
+                let mut options = vec![
+                    ("path".to_string(), definition.path.clone()),
+                    (
+                        "phony".to_string(),
+                        if definition.is_phony { "true" } else { "false" }.to_string(),
+                    ),
+                ];
+                if let Some(order) = definition.order {
+                    options.push(("order".to_string(), order.value.to_string()));
+                    if order.exclusive {
+                        options.push(("order_exclusive".to_string(), "true".to_string()));
+                    }
+                }
+                if let Some(assignee) = &definition.assignee {
+                    options.push(("assignee".to_string(), assignee.clone()));
+                }
+                if !definition.wbs.is_empty() {
+                    options.push(("wbs".to_string(), definition.wbs.join(",")));
+                }
+                naft::Node {
+                    tag: "Definition".to_string(),
+                    options,
+                    children: Vec::new(),
+                }
+            }));
+
+            naft::Node {
+                tag: "Chore".to_string(),
+                options: vec![("text".to_string(), chore.text.trim().to_string())],
+                children,
+            }
+        })
+        .collect();
+
+    naft::serialize_document(&[naft::Node {
+        tag: "Chores".to_string(),
+        options: vec![("count".to_string(), chores.len().to_string())],
+        children,
+    }])
+}
+
+fn render_chore_results_markdown(
+    forest: &Forest,
+    chores: &[&Chore],
+    details: bool,
+    default_assignee: Option<&str>,
+) -> String {
+    let mut output = String::from("# Chores\n");
+    let mut current_file = None;
+    let mut current_order = None;
+    for chore in chores {
+        let order = chore_order(forest, chore);
+        if current_file != Some(chore.file) {
+            current_file = Some(chore.file);
+            current_order = None;
+            output.push('\n');
+            output.push_str("## `");
+            output.push_str(&forest.files[chore.file.0].path.display().to_string());
+            output.push_str("`\n");
+        }
+        if details && current_order != Some(order) {
+            current_order = Some(order);
+            output.push('\n');
+            output.push_str("### Order ");
+            output.push_str(&order_label(order));
+            output.push('\n');
+        }
+        let defs = chore
+            .definitions
+            .iter()
+            .map(|id| forest.definitions[id.0].path.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let line = if details {
+            format!(
+                "{}  [{}]",
+                chore.text.trim(),
+                chore_tag_info(forest, chore, order, &defs, default_assignee)
+            )
+        } else {
+            chore.text.trim().to_string()
+        };
+        if is_markdown_enumeration(&line) {
+            output.push_str(&line);
+            output.push('\n');
+        } else {
+            output.push_str("- ");
+            output.push_str(&line);
+            output.push('\n');
+        }
+    }
+    output
 }
 
 fn chore_tag_info(
@@ -1481,13 +1686,13 @@ fn order_color(order: u32) -> u8 {
 
 fn print_help() {
     println!(
-        "chimp\n\nUSAGE:\n  chimp [--nocolor] [-V LEVEL|--verbose LEVEL] scan [PATH...]\n  chimp [--nocolor] [-V LEVEL|--verbose LEVEL] config [-C PATH]\n  chimp [--nocolor] [-V LEVEL|--verbose LEVEL] check [-e] [-n COUNT] [-C PATH]\n  chimp [--nocolor] [-V LEVEL|--verbose LEVEL] debug [-e] [-n COUNT] [-C PATH]\n  chimp [--nocolor] [-V LEVEL|--verbose LEVEL] wbs [-e] [-n COUNT] [-C PATH]\n  chimp [--nocolor] [-V LEVEL|--verbose LEVEL] chores [-e] [-d|--details] [-n COUNT] [-C PATH] [--status STATUS] [--assignee NAME|@NAME] [QUERY...]\n  chimp [--nocolor] [-V LEVEL|--verbose LEVEL] export DEST [--include-amp|--strip-amp] [--status STATUS] [--amp TAG] [--ext EXT] [PATH...]\n  chimp [-V LEVEL|--verbose LEVEL] lsp [-C PATH]\n  chimp [-V LEVEL|--verbose LEVEL] naft encode OUT.naft [-u] [-U] FOLDER...\n  chimp [-V LEVEL|--verbose LEVEL] naft decode IN.naft BASE_FOLDER\n"
+        "chimp\n\nUSAGE:\n  chimp [--nocolor] [-V LEVEL|--verbose LEVEL] [-c FILE|--config FILE] scan [PATH...]\n  chimp [--nocolor] [-V LEVEL|--verbose LEVEL] [-c FILE|--config FILE] config [-C PATH]\n  chimp [--nocolor] [-V LEVEL|--verbose LEVEL] [-c FILE|--config FILE] check [-e] [-n COUNT] [-C PATH]\n  chimp [--nocolor] [-V LEVEL|--verbose LEVEL] [-c FILE|--config FILE] debug [-e] [-n COUNT] [-C PATH]\n  chimp [--nocolor] [-V LEVEL|--verbose LEVEL] [-c FILE|--config FILE] wbs [-e] [-n COUNT] [-o FILE] [-C PATH]\n  chimp [--nocolor] [-V LEVEL|--verbose LEVEL] [-c FILE|--config FILE] chores [-e] [-d|--details] [-n COUNT] [-o FILE] [-C PATH] [--status STATUS] [--assignee NAME|@NAME] [QUERY...]\n  chimp [--nocolor] [-V LEVEL|--verbose LEVEL] [-c FILE|--config FILE] export DEST [--include-amp|--strip-amp] [--status STATUS] [--amp TAG] [--ext EXT] [PATH...]\n  chimp [-V LEVEL|--verbose LEVEL] [-c FILE|--config FILE] lsp [-C PATH]\n  chimp [-V LEVEL|--verbose LEVEL] naft encode OUT.naft [-u] [-U] FOLDER...\n  chimp [-V LEVEL|--verbose LEVEL] naft decode IN.naft BASE_FOLDER\n"
     );
 }
 
 fn print_chores_help() {
     println!(
-        "chimp chores\n\nUSAGE:\n  chimp chores [OPTIONS] [QUERY...]\n\nQUERY:\n  TERM                 Match TERM case-insensitively in Chore text, file paths,\n                       related Definition paths, or Definition assignees.\n  text:TERM            Match only the raw Chore-line text. Quote phrases, for\n                       example 'text:release blocker'.\n  @NAME                Match Chores assigned to NAME. Multiple assignees use OR.\n\nAll ordinary QUERY terms use AND. Assignee terms use OR with each other and AND\nwith ordinary terms. Definition paths use their normalized colon-separated form.\n\nOPTIONS:\n  -C, --grove PATH      Add a Grove root (repeatable)\n  -s, --status STATUS  Filter by status\n  -a, --assignee NAME  Filter by assignee (repeatable)\n  -d, --details        Show order and related metadata\n  -e, --edit           Open matching locations in the configured editor\n  -n, --limit COUNT    Limit reported Chores (and edited files)\n      --measure        Report phase wall-clock timings to stderr\n  -h, --help           Print this help\n"
+        "chimp chores\n\nUSAGE:\n  chimp chores [OPTIONS] [QUERY...]\n\nQUERY:\n  TERM                 Match TERM case-insensitively in Chore text, file paths,\n                       related Definition paths, or Definition assignees.\n  text:TERM            Match only the raw Chore-line text. Quote phrases, for\n                       example 'text:release blocker'.\n  @NAME                Match Chores assigned to NAME. Multiple assignees use OR.\n\nAll ordinary QUERY terms use AND. Assignee terms use OR with each other and AND\nwith ordinary terms. Definition paths use their normalized colon-separated form.\n\nOPTIONS:\n  -C, --grove PATH      Add a Grove root (repeatable)\n  -s, --status STATUS  Filter by status\n  -a, --assignee NAME  Filter by assignee (repeatable)\n  -d, --details        Show order and related metadata\n  -e, --edit           Open matching locations in the configured editor\n  -n, --limit COUNT    Limit reported Chores (and edited files)\n  -o, --output FILE    Write .naft, .md, or .markdown output to FILE\n      --measure        Report phase wall-clock timings to stderr\n  -h, --help           Print this help\n"
     );
 }
 

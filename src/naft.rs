@@ -264,7 +264,7 @@ fn serialize_node(node: &Node, indent: usize, output: &mut String) {
     if node.children.is_empty() {
         output.push('\n');
     } else {
-        output.push_str(" {\n");
+        output.push_str("{\n");
         for child in &node.children {
             serialize_node(child, indent + 1, output);
         }
@@ -519,7 +519,9 @@ mod tests {
         assert_eq!(nodes[0].option("name"), Some("root"));
         assert_eq!(nodes[0].children[0].option("name"), Some("a)b.md"));
         assert_eq!(nodes[0].children[0].option("content"), Some("x: [y] \\ z"));
-        assert!(serialize_document(&nodes).contains("a\\)b.md"));
+        let serialized = serialize_document(&nodes);
+        assert!(serialized.contains("[Folder](name:root){"));
+        assert!(serialized.contains("a\\)b.md"));
     }
 
     #[test]
