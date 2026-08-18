@@ -7,7 +7,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use chimp::{
     CheckIssue, Chore, ComputedOrder, Config, ExportOptions, Forest, GroveConfig, OrderMetadata,
-    Status, amp_path_depth, build_forest_with_reporter, computed_chore_order, export_forest,
+    Status, amp_path_depth, build_forest_with_reporter_without_occurrences, computed_chore_order,
+    export_forest,
 };
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -660,7 +661,7 @@ fn parse_verbose_level(value: &str) -> Result<u8> {
 }
 
 fn build_cli_forest(config: &Config, verbose: u8, checking: bool) -> Result<Forest> {
-    let forest = build_forest_with_reporter(config, verbose, |path| {
+    let forest = build_forest_with_reporter_without_occurrences(config, verbose, |path| {
         eprintln!("processing {}", path.display());
     })?;
     if verbose >= 2 && !checking && !forest.issues.is_empty() {

@@ -337,8 +337,27 @@ pub fn build_forest_with_reporter(
     Ok(build_forest_from_files(files))
 }
 
+/// Builds the semantic forest without the secondary AmpOccurrence index.
+/// Commands that only query chores do not need that index, which otherwise
+/// requires a second pass over every source file.
+pub fn build_forest_with_reporter_without_occurrences(
+    config: &Config,
+    verbose: u8,
+    report: impl FnMut(&Path),
+) -> Result<Forest> {
+    let files = load_files_with_reporter(config, verbose, report)?;
+    Ok(build_forest_from_files_with_options(files, false))
+}
+
 fn build_forest_from_files(files: Vec<SourceFile>) -> Forest {
-    let mut builder = ForestBuilder::new(files);
+    build_forest_from_files_with_options(files, true)
+}
+
+fn build_forest_from_files_with_options(
+    files: Vec<SourceFile>,
+    include_occurrences: bool,
+) -> Forest {
+    let mut builder = ForestBuilder::new(files, include_occurrences);
     builder.parse_files();
     builder.finish()
 }
@@ -404,6 +423,7 @@ pub fn build_forest_with_overlays(
 
 struct ForestBuilder {
     files: Vec<SourceFile>,
+    include_occurrences: bool,
     definitions: Vec<Definition>,
     definition_by_path: HashMap<String, DefinitionId>,
     definition_declarations: HashMap<String, Vec<DefinitionDeclaration>>,
@@ -423,9 +443,10 @@ struct DefinitionDeclaration {
 }
 
 impl ForestBuilder {
-    fn new(files: Vec<SourceFile>) -> Self {
+    fn new(files: Vec<SourceFile>, include_occurrences: bool) -> Self {
         Self {
             files,
+            include_occurrences,
             definitions: Vec::new(),
             definition_by_path: HashMap::new(),
             definition_declarations: HashMap::new(),
@@ -906,7 +927,11 @@ impl ForestBuilder {
         }
         self.add_filename_chores(&mut chores);
 
-        let amp_occurrences = self.build_amp_occurrences();
+        let amp_occurrences = if self.include_occurrences {
+            self.build_amp_occurrences()
+        } else {
+            Vec::new()
+        };
         Forest {
             files: self.files,
             definitions: self.definitions,
