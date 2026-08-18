@@ -1605,7 +1605,7 @@ extensions = ["rs"]
                 root: PathBuf::from("/tmp/grove"),
                 path: PathBuf::from("/tmp/grove/notes.md"),
                 bytes: Vec::new(),
-                text: String::new(),
+                text: std::sync::Arc::new(String::new()),
             }],
             definitions: vec![Definition {
                 id: DefinitionId(0),

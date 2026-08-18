@@ -1,5 +1,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::{Config, FileId, GroveConfig, Result, SourceFile};
 
@@ -96,7 +97,7 @@ fn walk_root(
                 root: root.to_path_buf(),
                 path,
                 bytes,
-                text,
+                text: Arc::new(text),
             });
         }
     }

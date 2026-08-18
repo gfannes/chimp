@@ -6,6 +6,7 @@ mod scan;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 
 pub use parse::{Metadata, extract_metadata};
 pub use scan::{load_files, load_files_with_reporter, write_file_exact};
@@ -59,7 +60,7 @@ pub struct SourceFile {
     pub root: PathBuf,
     pub path: PathBuf,
     pub bytes: Vec<u8>,
-    pub text: String,
+    pub text: Arc<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -313,7 +314,10 @@ struct ParsedLine {
     file: FileId,
     line: usize,
     column: usize,
-    text: String,
+    /// Byte range of the lossy UTF-8 source view (excluding line endings).
+    /// Keeping this as an offset avoids retaining another allocation for
+    /// every parsed chore; the original bytes remain in `SourceFile::bytes`.
+    span: (usize, usize),
     metadata: Metadata,
     inherited_refs: Vec<String>,
     is_chore: bool,
@@ -351,7 +355,7 @@ pub fn build_forest_with_overlays(
             .unwrap_or_else(|_| file.path.clone());
         if let Some(text) = overlays.get(&absolute) {
             file.bytes = text.as_bytes().to_vec();
-            file.text = text.clone();
+            file.text = Arc::new(text.clone());
         }
     }
     for (path, text) in overlays {
@@ -391,7 +395,7 @@ pub fn build_forest_with_overlays(
                 root,
                 path: path.clone(),
                 bytes: text.as_bytes().to_vec(),
-                text: text.clone(),
+                text: Arc::new(text.clone()),
             });
         }
     }
@@ -447,7 +451,7 @@ impl ForestBuilder {
         let file = &self.files[file_id.0];
         let path = file.path.clone();
         let grove = file.grove;
-        let text = file.text.clone();
+        let text = Arc::clone(&file.text);
         let is_markdown = path
             .extension()
             .and_then(|ext| ext.to_str())
@@ -459,16 +463,18 @@ impl ForestBuilder {
         let mut markdown_state = parse::MarkdownState::default();
         let filesystem_date = date_from_file_path(&path, &file.root);
 
-        let lines = text
-            .lines()
-            .enumerate()
-            .map(|(idx, line)| (idx + 1, line.to_string()))
-            .collect::<Vec<_>>();
-
-        for (line_no, raw_line) in lines {
+        let mut line_start = 0;
+        for (line_index, line_with_cr) in text.split_terminator('\n').enumerate() {
+            let raw_line = line_with_cr.strip_suffix('\r').unwrap_or(line_with_cr);
+            let line_no = line_index + 1;
+            let current_line_start = line_start;
+            line_start += line_with_cr.len() + 1;
             let Some(content) = parse::content_line(&raw_line, is_markdown, &path) else {
                 continue;
             };
+            // `content_line` may select only the comment payload in a source
+            // line. Keep the exact payload range rather than the whole line.
+            let content_offset = raw_line.find(content.text).unwrap_or(0);
             let metadata_text;
             let metadata_source = if is_markdown {
                 let Some(visible) =
@@ -580,7 +586,10 @@ impl ForestBuilder {
                     file: file_id,
                     line: line_no,
                     column: content.column,
-                    text: content.text.to_string(),
+                    span: (
+                        current_line_start + content_offset,
+                        current_line_start + content_offset + content.text.len(),
+                    ),
                     metadata: metadata.clone(),
                     inherited_refs,
                     is_chore: true,
@@ -874,7 +883,7 @@ impl ForestBuilder {
                 file: line.file,
                 line: line.line,
                 column: line.column,
-                text: line.text,
+                text: self.files[line.file.0].text[line.span.0..line.span.1].to_string(),
                 status: line.metadata.status,
                 date: line.metadata.date,
                 order: line.metadata.order,
