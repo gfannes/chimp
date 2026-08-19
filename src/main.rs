@@ -3,12 +3,12 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use chimp::{
     CheckIssue, Chore, ComputedOrder, Config, ExportOptions, Forest, GroveConfig, OrderMetadata,
-    Status, amp_path_depth, build_forest_with_reporter_without_occurrences, computed_chore_order,
-    export_forest,
+    Status, amp_path_depth, build_forest_with_reporter_without_occurrences,
+    build_forest_with_reporter_without_occurrences_measured, computed_chore_order, export_forest,
 };
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -49,7 +49,7 @@ fn run() -> Result<()> {
     match command.as_str() {
         "scan" => {
             let config = Config::from_groves(parse_path_groves(args)?);
-            let forest = build_cli_forest(&config, verbose, false)?;
+            let (forest, _) = build_cli_forest(&config, verbose, false, false)?;
             println!(
                 "Files: {}; Definitions: {}; Chores: {}",
                 forest.files.len(),
@@ -58,6 +58,7 @@ fn run() -> Result<()> {
             );
         }
         "chores" => {
+            let command_started = Instant::now();
             let mut extra_roots = Vec::new();
             let mut status_filter = None;
             let mut assignee_filters = Vec::new();
@@ -65,6 +66,7 @@ fn run() -> Result<()> {
             let mut details = false;
             let mut limit = None;
             let mut edit = false;
+            let mut measure = false;
 
             while let Some(arg) = args.next() {
                 match arg.as_str() {
@@ -87,6 +89,7 @@ fn run() -> Result<()> {
                         );
                     }
                     "-d" | "--details" => details = true,
+                    "--measure" => measure = true,
                     "-e" | "--edit" => edit = true,
                     "-n" | "--limit" => {
                         let value = args.next().ok_or("-n requires a count")?;
@@ -102,12 +105,16 @@ fn run() -> Result<()> {
                 }
             }
 
+            let started = Instant::now();
             let cli_config = default_cli_config_with_extra(extra_roots)?;
-            let forest = build_cli_forest(
+            let config_duration = started.elapsed();
+            let (forest, build_measurements) = build_cli_forest(
                 &Config::from_groves(cli_config.groves.clone()),
                 verbose,
                 false,
+                measure,
             )?;
+            let mut query_measurements = ChoreMeasurements::default();
             let locations = print_chore_search_results(
                 &forest,
                 status_filter,
@@ -117,9 +124,42 @@ fn run() -> Result<()> {
                 details,
                 limit,
                 cli_config.default_assignee.as_deref(),
+                measure.then_some(&mut query_measurements),
             );
             if edit {
                 open_editor_locations(cli_config.editor.as_deref(), &locations, limit)?;
+            }
+            if measure {
+                let build = build_measurements.expect("measurements requested");
+                eprintln!("Measurements:");
+                print_measurement("configuration", config_duration);
+                print_measurement(
+                    "scanner total (file discovery and reading)",
+                    build.load_files,
+                );
+                let scan = build.scan;
+                print_measurement("  .gitignore handling", scan.gitignore);
+                print_measurement("  directory entry enumeration", scan.entry_enumeration);
+                print_measurement("  directory entry sorting", scan.entry_sorting);
+                print_measurement("  file metadata checks", scan.metadata_checks);
+                print_measurement("  file reads", scan.file_reads);
+                print_measurement("  UTF-8 conversion", scan.utf8_conversion);
+                print_measurement("  other scanner work", scan.other);
+                eprintln!(
+                    "  scanner counts: directories={} candidates={} loaded={} bytes={}",
+                    scan.directories_visited,
+                    scan.candidate_files,
+                    scan.loaded_files,
+                    scan.bytes_read,
+                );
+                print_measurement("parsing and validation", build.parse_files);
+                print_measurement("relationship resolution", build.finish);
+                print_measurement(
+                    "Chore filtering and sorting",
+                    query_measurements.filter_sort,
+                );
+                print_measurement("output", query_measurements.output);
+                print_measurement("total", command_started.elapsed());
             }
         }
         "wbs" => {
@@ -142,9 +182,10 @@ fn run() -> Result<()> {
                 }
             }
             let cli_config = default_cli_config_with_extra(extra_roots)?;
-            let forest = build_cli_forest(
+            let (forest, _) = build_cli_forest(
                 &Config::from_groves(cli_config.groves.clone()),
                 verbose,
+                false,
                 false,
             )?;
             let locations = print_wbs_results(&forest, color);
@@ -187,10 +228,11 @@ fn run() -> Result<()> {
                 }
             }
             let cli_config = default_cli_config_with_extra(extra_roots)?;
-            let forest = build_cli_forest(
+            let (forest, _) = build_cli_forest(
                 &Config::from_groves(cli_config.groves.clone()),
                 verbose,
                 true,
+                false,
             )?;
             let locations = print_check_issues(&forest);
             if edit {
@@ -217,9 +259,10 @@ fn run() -> Result<()> {
                 }
             }
             let cli_config = default_cli_config_with_extra(extra_roots)?;
-            let forest = build_cli_forest(
+            let (forest, _) = build_cli_forest(
                 &Config::from_groves(cli_config.groves.clone()),
                 verbose,
+                false,
                 false,
             )?;
             print_debug(&forest, color);
@@ -268,8 +311,12 @@ fn run() -> Result<()> {
             }
 
             let destination = destination.ok_or("export requires a destination folder")?;
-            let forest =
-                build_cli_forest(&Config::from_groves(default_groves(roots)?), verbose, false)?;
+            let (forest, _) = build_cli_forest(
+                &Config::from_groves(default_groves(roots)?),
+                verbose,
+                false,
+                false,
+            )?;
             let summary = export_forest(&forest, destination, &options)?;
             println!("Files written: {}", summary.files_written);
         }
@@ -660,10 +707,26 @@ fn parse_verbose_level(value: &str) -> Result<u8> {
     Ok(level)
 }
 
-fn build_cli_forest(config: &Config, verbose: u8, checking: bool) -> Result<Forest> {
-    let forest = build_forest_with_reporter_without_occurrences(config, verbose, |path| {
-        eprintln!("processing {}", path.display());
-    })?;
+fn build_cli_forest(
+    config: &Config,
+    verbose: u8,
+    checking: bool,
+    measure: bool,
+) -> Result<(Forest, Option<chimp::ForestBuildMeasurements>)> {
+    let (forest, measurements) = if measure {
+        let (forest, measurements) =
+            build_forest_with_reporter_without_occurrences_measured(config, verbose, |path| {
+                eprintln!("processing {}", path.display())
+            })?;
+        (forest, Some(measurements))
+    } else {
+        (
+            build_forest_with_reporter_without_occurrences(config, verbose, |path| {
+                eprintln!("processing {}", path.display());
+            })?,
+            None,
+        )
+    };
     if verbose >= 2 && !checking && !forest.issues.is_empty() {
         eprintln!(
             "warning: scan found {} potentially suspicious issue(s); run `chimp check` for details",
@@ -682,7 +745,11 @@ fn build_cli_forest(config: &Config, verbose: u8, checking: bool) -> Result<Fore
             );
         }
     }
-    Ok(forest)
+    Ok((forest, measurements))
+}
+
+fn print_measurement(label: &str, duration: Duration) {
+    eprintln!("  {label}: {:.3} ms", duration.as_secs_f64() * 1_000.0);
 }
 
 fn print_config(config: &CliConfig) {
@@ -1137,9 +1204,21 @@ fn civil_date_from_unix_days(days: i64) -> (i64, u32, u32) {
 }
 
 fn print_wbs_results(forest: &Forest, color: bool) -> Vec<FileLocation> {
-    print_chore_results(forest, color, false, None, None, |forest, chore| {
-        chore_has_wbs(forest, chore)
-    })
+    print_chore_results(
+        forest,
+        color,
+        false,
+        None,
+        None,
+        |forest, chore| chore_has_wbs(forest, chore),
+        None,
+    )
+}
+
+#[derive(Debug, Default)]
+struct ChoreMeasurements {
+    filter_sort: Duration,
+    output: Duration,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1152,6 +1231,7 @@ fn print_chore_search_results(
     details: bool,
     limit: Option<usize>,
     default_assignee: Option<&str>,
+    measurements: Option<&mut ChoreMeasurements>,
 ) -> Vec<FileLocation> {
     print_chore_results(
         forest,
@@ -1169,6 +1249,7 @@ fn print_chore_search_results(
                 default_assignee,
             )
         },
+        measurements,
     )
 }
 
@@ -1179,7 +1260,9 @@ fn print_chore_results(
     limit: Option<usize>,
     default_assignee: Option<&str>,
     matches: impl Fn(&Forest, &Chore) -> bool,
+    mut measurements: Option<&mut ChoreMeasurements>,
 ) -> Vec<FileLocation> {
+    let started = measurements.as_ref().map(|_| Instant::now());
     let mut chores = forest
         .chores
         .iter()
@@ -1196,7 +1279,11 @@ fn print_chore_results(
             .then_with(|| left.line.cmp(&right.line))
             .then_with(|| left.column.cmp(&right.column))
     });
+    if let (Some(measurements), Some(started)) = (measurements.as_deref_mut(), started) {
+        measurements.filter_sort = started.elapsed();
+    }
 
+    let started = measurements.as_ref().map(|_| Instant::now());
     let mut current_file = None;
     let mut current_order = None;
     let mut locations = Vec::new();
@@ -1255,6 +1342,9 @@ fn print_chore_results(
                 if defs.is_empty() { "-" } else { &defs }
             );
         }
+    }
+    if let (Some(measurements), Some(started)) = (measurements, started) {
+        measurements.output = started.elapsed();
     }
     locations
 }
@@ -1397,7 +1487,7 @@ fn print_help() {
 
 fn print_chores_help() {
     println!(
-        "chimp chores\n\nUSAGE:\n  chimp chores [OPTIONS] [QUERY...]\n\nQUERY:\n  TERM                 Match TERM case-insensitively in Chore text, file paths,\n                       related Definition paths, or Definition assignees.\n  text:TERM            Match only the raw Chore-line text. Quote phrases, for\n                       example 'text:release blocker'.\n  @NAME                Match Chores assigned to NAME. Multiple assignees use OR.\n\nAll ordinary QUERY terms use AND. Assignee terms use OR with each other and AND\nwith ordinary terms. Definition paths use their normalized colon-separated form.\n\nOPTIONS:\n  -C, --grove PATH      Add a Grove root (repeatable)\n  -s, --status STATUS  Filter by status\n  -a, --assignee NAME  Filter by assignee (repeatable)\n  -d, --details        Show order and related metadata\n  -e, --edit           Open matching locations in the configured editor\n  -n, --limit COUNT    Limit reported Chores (and edited files)\n  -h, --help           Print this help\n"
+        "chimp chores\n\nUSAGE:\n  chimp chores [OPTIONS] [QUERY...]\n\nQUERY:\n  TERM                 Match TERM case-insensitively in Chore text, file paths,\n                       related Definition paths, or Definition assignees.\n  text:TERM            Match only the raw Chore-line text. Quote phrases, for\n                       example 'text:release blocker'.\n  @NAME                Match Chores assigned to NAME. Multiple assignees use OR.\n\nAll ordinary QUERY terms use AND. Assignee terms use OR with each other and AND\nwith ordinary terms. Definition paths use their normalized colon-separated form.\n\nOPTIONS:\n  -C, --grove PATH      Add a Grove root (repeatable)\n  -s, --status STATUS  Filter by status\n  -a, --assignee NAME  Filter by assignee (repeatable)\n  -d, --details        Show order and related metadata\n  -e, --edit           Open matching locations in the configured editor\n  -n, --limit COUNT    Limit reported Chores (and edited files)\n      --measure        Report phase wall-clock timings to stderr\n  -h, --help           Print this help\n"
     );
 }
 

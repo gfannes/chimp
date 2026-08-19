@@ -1,6 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use crate::{Config, FileId, GroveConfig, Result, SourceFile};
 
@@ -11,8 +12,44 @@ pub fn load_files(config: &Config) -> Result<Vec<SourceFile>> {
 pub fn load_files_with_reporter(
     config: &Config,
     verbose: u8,
-    mut report: impl FnMut(&Path),
+    report: impl FnMut(&Path),
 ) -> Result<Vec<SourceFile>> {
+    load_files_with_reporter_impl(config, verbose, report, None)
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ScanMeasurements {
+    pub directory_traversal: Duration,
+    pub gitignore: Duration,
+    pub entry_enumeration: Duration,
+    pub entry_sorting: Duration,
+    pub metadata_checks: Duration,
+    pub file_reads: Duration,
+    pub utf8_conversion: Duration,
+    pub other: Duration,
+    pub directories_visited: usize,
+    pub candidate_files: usize,
+    pub loaded_files: usize,
+    pub bytes_read: usize,
+}
+
+pub fn load_files_with_reporter_measured(
+    config: &Config,
+    verbose: u8,
+    report: impl FnMut(&Path),
+) -> Result<(Vec<SourceFile>, ScanMeasurements)> {
+    let mut measurements = ScanMeasurements::default();
+    let files = load_files_with_reporter_impl(config, verbose, report, Some(&mut measurements))?;
+    Ok((files, measurements))
+}
+
+fn load_files_with_reporter_impl(
+    config: &Config,
+    verbose: u8,
+    mut report: impl FnMut(&Path),
+    mut measurements: Option<&mut ScanMeasurements>,
+) -> Result<Vec<SourceFile>> {
+    let traversal_started = measurements.as_ref().map(|_| Instant::now());
     let mut files = Vec::new();
     for (grove, grove_config) in config.groves.iter().enumerate() {
         let root = grove_config.root.canonicalize().map_err(|error| {
@@ -30,7 +67,18 @@ pub fn load_files_with_reporter(
             &mut files,
             verbose,
             &mut report,
+            measurements.as_deref_mut(),
         )?;
+    }
+    if let (Some(measurements), Some(started)) = (measurements, traversal_started) {
+        measurements.directory_traversal = started.elapsed();
+        let accounted = measurements.gitignore
+            + measurements.entry_enumeration
+            + measurements.entry_sorting
+            + measurements.metadata_checks
+            + measurements.file_reads
+            + measurements.utf8_conversion;
+        measurements.other = measurements.directory_traversal.saturating_sub(accounted);
     }
     Ok(files)
 }
@@ -45,15 +93,33 @@ fn walk_root(
     files: &mut Vec<SourceFile>,
     verbose: u8,
     report: &mut impl FnMut(&Path),
+    mut measurements: Option<&mut ScanMeasurements>,
 ) -> Result<()> {
+    if let Some(measurements) = measurements.as_deref_mut() {
+        measurements.directories_visited += 1;
+    }
     if verbose >= 3 {
         report(dir);
     }
     let mut ignore = inherited_ignore;
+    let started = measurements.as_ref().map(|_| Instant::now());
     ignore.extend(read_gitignore(root, dir)?);
+    if let (Some(measurements), Some(started)) = (measurements.as_deref_mut(), started) {
+        measurements.gitignore += started.elapsed();
+    }
 
+    let started = measurements.as_ref().map(|_| Instant::now());
     let mut entries = fs::read_dir(dir)?.collect::<std::io::Result<Vec<_>>>()?;
-    entries.sort_by_key(|entry| entry.path());
+    if let (Some(measurements), Some(started)) = (measurements.as_deref_mut(), started) {
+        measurements.entry_enumeration += started.elapsed();
+    }
+    let started = measurements.as_ref().map(|_| Instant::now());
+    // All entries share this directory's parent, so filename order is
+    // equivalent to full-path order. Cache the key once per entry.
+    entries.sort_by_cached_key(|entry| entry.file_name());
+    if let (Some(measurements), Some(started)) = (measurements.as_deref_mut(), started) {
+        measurements.entry_sorting += started.elapsed();
+    }
 
     for entry in entries {
         let path = entry.path();
@@ -76,20 +142,39 @@ fn walk_root(
                 files,
                 verbose,
                 report,
+                measurements.as_deref_mut(),
             )?;
         } else if file_type.is_file() && is_supported_file(&path, grove_config) {
-            if grove_config
-                .max_filesize
-                .is_some_and(|max| entry.metadata().is_ok_and(|metadata| metadata.len() > max))
-            {
+            if let Some(measurements) = measurements.as_deref_mut() {
+                measurements.candidate_files += 1;
+            }
+            if grove_config.max_filesize.is_some_and(|max| {
+                let started = measurements.as_ref().map(|_| Instant::now());
+                let too_large = entry.metadata().is_ok_and(|metadata| metadata.len() > max);
+                if let (Some(measurements), Some(started)) = (measurements.as_deref_mut(), started)
+                {
+                    measurements.metadata_checks += started.elapsed();
+                }
+                too_large
+            }) {
                 continue;
             }
             if verbose >= 3 {
                 report(&path);
             }
+            let started = measurements.as_ref().map(|_| Instant::now());
             let bytes = fs::read(&path)
                 .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
+            if let (Some(measurements), Some(started)) = (measurements.as_deref_mut(), started) {
+                measurements.file_reads += started.elapsed();
+                measurements.bytes_read += bytes.len();
+                measurements.loaded_files += 1;
+            }
+            let started = measurements.as_ref().map(|_| Instant::now());
             let text = String::from_utf8_lossy(&bytes).into_owned();
+            if let (Some(measurements), Some(started)) = (measurements.as_deref_mut(), started) {
+                measurements.utf8_conversion += started.elapsed();
+            }
             let id = FileId(files.len());
             files.push(SourceFile {
                 id,

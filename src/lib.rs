@@ -7,9 +7,13 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 pub use parse::{Metadata, extract_metadata};
-pub use scan::{load_files, load_files_with_reporter, write_file_exact};
+pub use scan::{
+    ScanMeasurements, load_files, load_files_with_reporter, load_files_with_reporter_measured,
+    write_file_exact,
+};
 
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -123,6 +127,15 @@ pub struct Forest {
     pub chores: Vec<Chore>,
     pub amp_occurrences: Vec<AmpOccurrence>,
     pub issues: Vec<CheckIssue>,
+}
+
+/// Wall-clock measurements for the major phases of building a [`Forest`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ForestBuildMeasurements {
+    pub scan: ScanMeasurements,
+    pub load_files: Duration,
+    pub parse_files: Duration,
+    pub finish: Duration,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -347,6 +360,37 @@ pub fn build_forest_with_reporter_without_occurrences(
 ) -> Result<Forest> {
     let files = load_files_with_reporter(config, verbose, report)?;
     Ok(build_forest_from_files_with_options(files, false))
+}
+
+/// Builds the Chore-query forest and records its major phases.
+///
+/// Callers that do not need measurements should use
+/// [`build_forest_with_reporter_without_occurrences`] to avoid timing overhead.
+pub fn build_forest_with_reporter_without_occurrences_measured(
+    config: &Config,
+    verbose: u8,
+    report: impl FnMut(&Path),
+) -> Result<(Forest, ForestBuildMeasurements)> {
+    let (files, scan) = load_files_with_reporter_measured(config, verbose, report)?;
+    let load_files = scan.directory_traversal;
+
+    let mut builder = ForestBuilder::new(files, false);
+    let started = Instant::now();
+    builder.parse_files();
+    let parse_files = started.elapsed();
+
+    let started = Instant::now();
+    let forest = builder.finish();
+    let finish = started.elapsed();
+    Ok((
+        forest,
+        ForestBuildMeasurements {
+            scan,
+            load_files,
+            parse_files,
+            finish,
+        },
+    ))
 }
 
 fn build_forest_from_files(files: Vec<SourceFile>) -> Forest {

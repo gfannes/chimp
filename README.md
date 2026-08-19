@@ -67,7 +67,13 @@ put `--nocolor` before the command to disable it. Use `--details` to
 append line and tag metadata after each Chore. Use `-n COUNT` to show only the
 first COUNT Chores after filtering and sorting. Chores are sorted globally
 across files; file headers are printed only when the output stream moves to a
-different file. Config can specify `default_assignee`; unassigned Chores match
+different file. Use `--measure` to report wall-clock time for configuration,
+scanner total (file discovery and reading), parsing and validation, relationship resolution,
+filtering and sorting, output, and the complete command to stderr. The scanner
+breakdown includes directory traversal, `.gitignore` handling, entry
+enumeration, sorting, metadata checks, file reads, UTF-8 conversion, other scanner work,
+and file/byte counts. These sub-phases reconcile to the scanner total. Config
+can specify `default_assignee`; unassigned Chores match
 that assignee. Multiple assignee filters such as `@geert @alice` match either
 assignee. An exclusive assignee such as `&^@geert` clears assignees inherited
 from broader scopes; narrower scopes continue from `geert`. DONE Chores and

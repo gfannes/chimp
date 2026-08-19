@@ -789,6 +789,49 @@ fn naft_encode_skips_hidden_and_ignored_unless_flags_are_set() {
     fs::remove_dir_all(source).unwrap();
 }
 
+#[test]
+fn chores_measure_reports_phase_timings_to_stderr() {
+    let dir = test_dir("cli-chores-measure");
+    let home = test_dir("cli-chores-measure-home");
+    fs::write(dir.join("notes.md"), "- [ ] TODO &work measured\n").unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_chimp"))
+        .env("HOME", &home)
+        .arg("chores")
+        .arg("--measure")
+        .arg("-C")
+        .arg(&dir)
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stdout.contains("measured"));
+    for phase in [
+        "configuration:",
+        "scanner total (file discovery and reading):",
+        ".gitignore handling:",
+        "directory entry enumeration:",
+        "directory entry sorting:",
+        "file metadata checks:",
+        "file reads:",
+        "UTF-8 conversion:",
+        "other scanner work:",
+        "scanner counts:",
+        "parsing and validation:",
+        "relationship resolution:",
+        "Chore filtering and sorting:",
+        "output:",
+        "total:",
+    ] {
+        assert!(stderr.contains(phase), "missing {phase} in {stderr}");
+    }
+
+    fs::remove_dir_all(dir).unwrap();
+    fs::remove_dir_all(home).unwrap();
+}
+
 fn test_dir(name: &str) -> PathBuf {
     let unique = SystemTime::now()
         .duration_since(UNIX_EPOCH)
